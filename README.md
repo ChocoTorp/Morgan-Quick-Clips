@@ -19,59 +19,70 @@ It's a single Swift file (`Sources/ClipEditor.swift`) compiled with `swiftc`.
 
 ## Build
 
+Two modes:
+
 ```bash
-./build.sh            # → build/Clip Editor.app   (ad-hoc signed)
+# Dev build — compiles only; uses Homebrew ffmpeg/whisper at runtime.
+brew install ffmpeg whisper-cpp dylibbundler
+./scripts/fetch-model.sh           # downloads the Whisper model (~142 MB)
+./build.sh                         # → build/Clip Editor.app (ad-hoc)
+
+# Self-contained build — bundles ffmpeg/whisper/backends + model INTO the app.
+./build.sh --bundle                # → build/Clip Editor.app (~182 MB, runs with no Homebrew)
 open "build/Clip Editor.app"
 ```
 
-Requires Xcode command line tools (`swiftc`) and the macOS 15+ SDK.
+Requires Xcode command line tools (`swiftc`) + macOS 15+ SDK. `--bundle` also needs
+`dylibbundler` and the Homebrew tools/model present on the **build** machine (they
+get copied in). Verified: with `--bundle`, the app runs ffmpeg + whisper + the ggml
+compute backends entirely from inside the bundle, with no Homebrew and an empty PATH.
 
-## Runtime dependencies (IMPORTANT — the app is NOT self-contained)
+## How self-containment works (`--bundle`)
 
-The app shells out to command-line tools that are **not bundled**. On the build
-machine these come from Homebrew:
+`scripts/bundle-deps.sh` copies the tools into the app and rewrites their dylib
+links so nothing points at Homebrew:
 
-```bash
-brew install ffmpeg whisper-cpp
-./scripts/fetch-model.sh        # downloads the Whisper model (~142 MB)
+```
+Contents/Helpers/      ffmpeg, ffprobe, whisper-cli, libggml-*.so (compute backends)
+Contents/Frameworks/   all dependent dylibs (libav*, x264/x265, libggml*, libomp, …)
+Contents/Resources/    ggml-base.en.bin (Whisper model), AppIcon.icns
 ```
 
-- **ffmpeg / ffprobe** — used for all conversion, recording finalize, audio extract.
-  Resolved at runtime from `/opt/homebrew/bin`, `/usr/local/bin`, or `/usr/bin`.
-- **whisper-cli** (from `whisper-cpp`) + a **Whisper model** — used for captions.
+The code (`resolveTools()`) loads tools/model from the bundle when present and
+falls back to Homebrew for dev builds. ggml backend plugins sit next to
+`whisper-cli` so ggml auto-discovers them on any machine.
 
-If these aren't present, conversion/captions silently won't work.
+> Captions are **soft/embedded** subtitles (`mov_text`) + sidecar `.srt`/`.txt`.
+> True burn-in needs an ffmpeg with `libass`, which the bundled ffmpeg lacks.
 
-> Note on burn-in: rendering captions *onto* the video needs an ffmpeg built with
-> `libass`. Homebrew's ffmpeg may lack it; this app therefore uses **soft/embedded**
-> subtitles (`mov_text`) rather than burned-in text.
+## Remaining steps before public download
 
-## Known limitations / TODO before public distribution
+The app is now **self-contained**, but to host it for others you still need:
 
-This runs on the author's Mac but is **not yet distributable**:
-
-1. **Not self-contained** — ffmpeg/ffprobe/whisper-cli and the model are external.
-   To ship, bundle **static** builds of these into `Contents/Resources` and load
-   them from the bundle instead of Homebrew. (Bundling ffmpeg built with x264/x265
-   makes the distribution **GPL** — provide source/offer accordingly.)
-2. **Hard-coded model path** — `gWhisperModel` in `Sources/ClipEditor.swift` points
-   at `~/.hermes/skills/media/ffmpeg/models/ggml-base.en.bin`. Make this resolve
-   from the app bundle for distribution.
-3. **Signing/notarization** — currently ad-hoc / self-signed, so downloaded copies
-   are blocked by Gatekeeper. For public download you need an **Apple Developer ID**
-   certificate and **notarization** (`codesign --options runtime` + `notarytool` +
-   `stapler`).
-4. **Architecture** — built `arm64` only. Build a **universal** binary (and bundle
-   universal tools) for Intel Macs.
-5. **macOS 15+** required (ScreenCaptureKit `SCRecordingOutput`).
+1. **Apple Developer Program ($99/yr)** → a *Developer ID Application* certificate.
+2. **Sign + notarize:**
+   ```bash
+   SIGN_ID="Developer ID Application: Your Name (TEAMID)" ./build.sh --bundle
+   ./scripts/notarize.sh "build/Clip Editor.app"
+   ```
+   (`build.sh` applies the hardened runtime + `Resources/entitlements.plist`;
+   `notarize.sh` submits to Apple and staples the ticket.)
+3. **Architecture** — built `arm64` only (bundled tools are arm64). For Intel Macs
+   you'd need a universal build with universal tools.
+4. **macOS 15+** required (ScreenCaptureKit `SCRecordingOutput`).
+5. **Licensing** — the bundled ffmpeg (x264/x265) makes the distribution **GPL**;
+   provide the corresponding source/offer when you publish.
 
 ## Layout
 
 ```
-Sources/ClipEditor.swift   # the whole app
-Resources/AppIcon.icns     # app icon
-build.sh                   # compile + assemble + sign the .app
-scripts/fetch-model.sh     # download the Whisper model
+Sources/ClipEditor.swift     # the whole app
+Resources/AppIcon.icns       # app icon
+Resources/entitlements.plist # hardened-runtime entitlements (for notarization)
+build.sh                     # compile + (optional) bundle + sign
+scripts/bundle-deps.sh       # bundle ffmpeg/whisper/backends/model into the .app
+scripts/fetch-model.sh       # download the Whisper model
+scripts/notarize.sh          # notarize + staple (after you have a Developer ID)
 ```
 
 ## Licensing

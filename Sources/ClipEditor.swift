@@ -14,15 +14,31 @@ import UniformTypeIdentifiers
 var gFFmpeg = "ffmpeg"
 var gFFprobe = "ffprobe"
 var gWhisper = "whisper-cli"
-let gWhisperModel = "/Users/morgan/.hermes/skills/media/ffmpeg/models/ggml-base.en.bin"
+var gWhisperModel = ""
+var gGgmlBackends = ""   // dir of bundled ggml backend plugins (empty in dev → use Homebrew default)
 func resolveTools() {
+    // Prefer tools/model bundled inside the .app (self-contained, for distribution);
+    // fall back to Homebrew/PATH + a dev model path (for local development builds).
+    let helpers = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers")
+    // ggml auto-discovers backend plugins in the executable's dir (Helpers); also
+    // pass GGML_BACKEND_PATH explicitly as a belt-and-suspenders.
+    if FileManager.default.fileExists(atPath: helpers.path + "/libggml-metal.so") {
+        gGgmlBackends = helpers.path
+    }
     func find(_ n: String) -> String {
+        let bundled = helpers.appendingPathComponent(n).path
+        if FileManager.default.isExecutableFile(atPath: bundled) { return bundled }
         for p in ["/opt/homebrew/bin/", "/usr/local/bin/", "/usr/bin/"] {
             if FileManager.default.isExecutableFile(atPath: p + n) { return p + n }
         }
         return n
     }
     gFFmpeg = find("ffmpeg"); gFFprobe = find("ffprobe"); gWhisper = find("whisper-cli")
+    if let m = Bundle.main.url(forResource: "ggml-base.en", withExtension: "bin") {
+        gWhisperModel = m.path
+    } else {
+        gWhisperModel = NSHomeDirectory() + "/.hermes/skills/media/ffmpeg/models/ggml-base.en.bin"
+    }
 }
 var whisperAvailable: Bool {
     FileManager.default.isExecutableFile(atPath: gWhisper) && FileManager.default.fileExists(atPath: gWhisperModel)
@@ -1027,7 +1043,8 @@ struct ContentView: View {
         // whisper wants 16 kHz mono PCM
         _ = shellCapture("\(gFFmpeg) -y -v error -i \"\(input.path)\" -ss \(st) -t \(dur) -vn -ar 16000 -ac 1 -c:a pcm_s16le \"\(wav)\" 2>&1")
         guard fileBytes(wav) > 1000 else { return (nil, nil) }   // no audio track
-        _ = shellCapture("\(gWhisper) -m \"\(gWhisperModel)\" -f \"\(wav)\" -osrt -otxt -of \"\(base)\" 2>&1")
+        let backendEnv = gGgmlBackends.isEmpty ? "" : "GGML_BACKEND_PATH=\"\(gGgmlBackends)\" "
+        _ = shellCapture("\(backendEnv)\(gWhisper) -m \"\(gWhisperModel)\" -f \"\(wav)\" -osrt -otxt -of \"\(base)\" 2>&1")
         let srt = base + ".srt", txt = base + ".txt"
         return (fileBytes(srt) > 0 ? srt : nil, fileBytes(txt) > 0 ? txt : nil)
     }

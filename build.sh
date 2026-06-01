@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — compile MB Clip Editor into a .app bundle.
+# build.sh — compile SimpleClips into a .app bundle.
 #
 # Usage:
 #   ./build.sh                      # dev build: compile only, ad-hoc sign, needs Homebrew tools at runtime
@@ -15,9 +15,9 @@ cd "$(dirname "$0")"
 
 BUNDLE=0; [ "${1:-}" = "--bundle" ] && BUNDLE=1
 
-APP_NAME="Clip Editor"
-EXE="MBClipEditor"
-BUNDLE_ID="com.mblocal.clipeditor1"
+APP_NAME="SimpleClips"
+EXE="SimpleClips"
+BUNDLE_ID="com.mblocal.clipeditor1"   # unchanged on purpose: keeps the existing TCC permission grant
 OUT_DIR="${APP_OUT:-$(pwd)/build}"
 APP="$OUT_DIR/$APP_NAME.app"
 SIGN_ID="${SIGN_ID:--}"                 # default ad-hoc
@@ -33,8 +33,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>MB Clip Editor</string>
-  <key>CFBundleDisplayName</key><string>MB Clip Editor</string>
+  <key>CFBundleName</key><string>SimpleClips</string>
+  <key>CFBundleDisplayName</key><string>SimpleClips</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleVersion</key><string>1.0</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
@@ -58,21 +58,31 @@ if [ "$BUNDLE" = 1 ]; then
   ./scripts/bundle-deps.sh "$APP"
 fi
 
-echo "==> codesign"
-# Sign inside-out: bundled dylibs + helper tools first, then the app.
-RUNTIME=""; [ "$SIGN_ID" != "-" ] && RUNTIME="--options runtime"
-if [ "$BUNDLE" = 1 ]; then
-  # Sign inner-most first: dylibs/plugins, then helper executables.
-  find "$APP/Contents/Frameworks" \( -name "*.dylib" -o -name "*.so" \) -exec \
-    codesign --force $RUNTIME --timestamp -s "$SIGN_ID" {} \; 2>/dev/null || true
-  find "$APP/Contents/Helpers" -name "*.so" -exec \
-    codesign --force $RUNTIME --timestamp -s "$SIGN_ID" {} \; 2>/dev/null || true
-  for t in ffmpeg ffprobe whisper-cli; do
-    codesign --force $RUNTIME --timestamp -s "$SIGN_ID" "$APP/Contents/Helpers/$t"
-  done
+# Hardened runtime + entitlements + secure timestamp ONLY for notarization
+# (Developer ID, or NOTARIZE=1). Those need Apple's network timestamp service and
+# would FAIL with a local self-signed/ad-hoc cert — which silently leaves an
+# ad-hoc signature whose requirement changes every build and breaks TCC grants.
+HARDEN=0
+case "$SIGN_ID" in "Developer ID"*) HARDEN=1;; esac
+[ "${NOTARIZE:-0}" = 1 ] && HARDEN=1
+
+if [ "$HARDEN" = 1 ]; then
+  echo "==> codesign (hardened runtime, for notarization)"
+  if [ "$BUNDLE" = 1 ]; then
+    find "$APP/Contents/Frameworks" \( -name "*.dylib" -o -name "*.so" \) -exec \
+      codesign --force --options runtime --timestamp -s "$SIGN_ID" {} \; 2>/dev/null || true
+    find "$APP/Contents/Helpers" -name "*.so" -exec \
+      codesign --force --options runtime --timestamp -s "$SIGN_ID" {} \; 2>/dev/null || true
+    for t in ffmpeg ffprobe whisper-cli; do
+      codesign --force --options runtime --timestamp -s "$SIGN_ID" "$APP/Contents/Helpers/$t"
+    done
+  fi
+  codesign --force --options runtime --timestamp --entitlements "$ENT" -s "$SIGN_ID" "$APP/Contents/MacOS/$EXE"
+  codesign --force --options runtime --timestamp --entitlements "$ENT" -s "$SIGN_ID" "$APP"
+else
+  echo "==> codesign (local: plain deep sign — no timestamp/runtime)"
+  codesign --force --deep -s "$SIGN_ID" "$APP"
 fi
-codesign --force $RUNTIME --timestamp --entitlements "$ENT" -s "$SIGN_ID" "$APP/Contents/MacOS/$EXE"
-codesign --force $RUNTIME --timestamp --entitlements "$ENT" -s "$SIGN_ID" "$APP"
 
 echo "==> Done: $APP"
 du -sh "$APP" 2>/dev/null | awk '{print "    size: "$1}'

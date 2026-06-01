@@ -1,4 +1,4 @@
-# MB Clip Editor (Morgan Quick Clips)
+# SimpleClips
 
 A native macOS app for quickly turning screen recordings and video/GIF files into
 trimmed, cropped, scaled, captioned clips for sharing.
@@ -25,11 +25,11 @@ Two modes:
 # Dev build — compiles only; uses Homebrew ffmpeg/whisper at runtime.
 brew install ffmpeg whisper-cpp dylibbundler
 ./scripts/fetch-model.sh           # downloads the Whisper model (~142 MB)
-./build.sh                         # → build/Clip Editor.app (ad-hoc)
+./build.sh                         # → build/SimpleClips.app (ad-hoc)
 
 # Self-contained build — bundles ffmpeg/whisper/backends + model INTO the app.
-./build.sh --bundle                # → build/Clip Editor.app (~182 MB, runs with no Homebrew)
-open "build/Clip Editor.app"
+./build.sh --bundle                # → build/SimpleClips.app (~182 MB, runs with no Homebrew)
+open "build/SimpleClips.app"
 ```
 
 Requires Xcode command line tools (`swiftc`) + macOS 15+ SDK. `--bundle` also needs
@@ -63,7 +63,7 @@ The app is now **self-contained**, but to host it for others you still need:
 2. **Sign + notarize:**
    ```bash
    SIGN_ID="Developer ID Application: Your Name (TEAMID)" ./build.sh --bundle
-   ./scripts/notarize.sh "build/Clip Editor.app"
+   ./scripts/notarize.sh "build/SimpleClips.app"
    ```
    (`build.sh` applies the hardened runtime + `Resources/entitlements.plist`;
    `notarize.sh` submits to Apple and staples the ticket.)

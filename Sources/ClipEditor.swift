@@ -44,15 +44,30 @@ var whisperAvailable: Bool {
     FileManager.default.isExecutableFile(atPath: gWhisper) && FileManager.default.fileExists(atPath: gWhisperModel)
 }
 
-func shellCapture(_ cmd: String) -> String {
+// Run a tool directly via Process with an ARGUMENT ARRAY (no shell). This makes
+// shell injection impossible — file names/paths are passed as literal argv entries,
+// never parsed by a shell. stderr is merged into stdout (replaces "2>&1").
+@discardableResult
+func runTool(_ exe: String, _ args: [String], env: [String: String] = [:]) -> String {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/bin/bash")
-    p.arguments = ["-c", cmd]
-    let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
-    try? p.run(); p.waitUntilExit()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    if !env.isEmpty {
+        var e = ProcessInfo.processInfo.environment
+        for (k, v) in env { e[k] = v }
+        p.environment = e
+    }
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe          // merge stderr → same pipe
+    do { try p.run() } catch { return "" }
     let d = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
     return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
+
+// Split a plan() codec string ("-c:v libx264 -crf 18 …") into argv tokens.
+func args(_ s: String) -> [String] { s.split(separator: " ").map(String.init) }
 
 func fittedRect(_ container: CGSize, _ sw: CGFloat, _ sh: CGFloat) -> CGRect {
     guard sw > 0, sh > 0, container.width > 0, container.height > 0 else { return .zero }
@@ -519,37 +534,43 @@ struct Timeline: View {
 
     var body: some View {
         GeometryReader { geo in
-            let W = geo.size.width
+            // Inset the track by half a handle-width on each side so the handles are
+            // FULLY inside the interactive frame even at the extreme start/end.
+            let inset = hitW / 2
+            let W = max(1, geo.size.width - inset * 2)        // inner (track) width
             let dur = max(s.duration, 0.001)
-            let xStart = CGFloat(s.trimStart / dur) * W
-            let xEnd = CGFloat(s.trimEnd / dur) * W
-            let xCur = CGFloat(s.current / dur) * W
+            let xStart = inset + CGFloat(s.trimStart / dur) * W
+            let xEnd = inset + CGFloat(s.trimEnd / dur) * W
+            let xCur = inset + CGFloat(s.current / dur) * W
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 4).fill(Color.gray.opacity(0.25))
+                    .padding(.horizontal, inset)
                 // selected region
                 Rectangle().fill(Color.accentColor.opacity(0.30))
                     .frame(width: max(0, xEnd - xStart)).offset(x: xStart)
                 // playhead
                 Rectangle().fill(Color.white).frame(width: 2).offset(x: xCur - 1)
-                // trim handles
-                handle(color: .green).offset(x: xStart - 6)
-                    .gesture(DragGesture().onChanged { g in
-                        let t = clamp(Double(g.location.x / W) * dur, 0, s.trimEnd - 0.1)
+                // trim handles — wide grab area, yellow, with direction arrows.
+                handle(.right)                                  // start: ▶ points into the clip
+                    .offset(x: xStart - hitW / 2)
+                    .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
+                        let t = clamp(Double((g.location.x - inset) / W) * dur, 0, s.trimEnd - 0.1)
                         s.trimStart = t; s.seek(t)
                     })
-                handle(color: .red).offset(x: xEnd - 6)
-                    .gesture(DragGesture().onChanged { g in
-                        let t = clamp(Double(g.location.x / W) * dur, s.trimStart + 0.1, s.duration)
+                handle(.left)                                   // end: ◀ points into the clip
+                    .offset(x: xEnd - hitW / 2)
+                    .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
+                        let t = clamp(Double((g.location.x - inset) / W) * dur, s.trimStart + 0.1, s.duration)
                         s.trimEnd = t; s.seek(t)
                     })
             }
             .frame(height: 40)
+            .coordinateSpace(name: "tl")
             .contentShape(Rectangle())
-            .onTapGesture { /* seek on tap */ }
-            .gesture(DragGesture(minimumDistance: 0).onChanged { g in
-                // scrub playhead when dragging on the bar background
-                let t = clamp(Double(g.location.x / W) * dur, 0, s.duration)
-                if abs(g.location.x - xStart) > 10 && abs(g.location.x - xEnd) > 10 {
+            .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
+                // scrub playhead when dragging on the bar background (away from handles)
+                let t = clamp(Double((g.location.x - inset) / W) * dur, 0, s.duration)
+                if abs(g.location.x - xStart) > hitW / 2 && abs(g.location.x - xEnd) > hitW / 2 {
                     s.seek(t)
                 }
             })
@@ -557,9 +578,19 @@ struct Timeline: View {
         .frame(height: 40)
     }
 
-    func handle(color: Color) -> some View {
-        RoundedRectangle(cornerRadius: 3).fill(color).frame(width: 12, height: 40)
-            .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.white.opacity(0.8), lineWidth: 1))
+    enum Dir { case left, right }
+    private var hitW: CGFloat { 30 }   // generous grab width (no dead spot)
+
+    func handle(_ dir: Dir) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 3).fill(Color.yellow)
+                .frame(width: 16, height: 40)
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.55), lineWidth: 1))
+            Image(systemName: dir == .right ? "arrowtriangle.right.fill" : "arrowtriangle.left.fill")
+                .font(.system(size: 10, weight: .black)).foregroundColor(.black)
+        }
+        .frame(width: hitW, height: 40)        // wide, fully-hittable grab zone
+        .contentShape(Rectangle())
     }
 }
 
@@ -918,7 +949,7 @@ struct ContentView: View {
                 s.setStatus("● Recording\(s.regionOn ? " region" : "")\(s.micOn ? " + mic" : "")\(s.sysAudioOn ? " + audio" : "") — click Stop when done.", "work")
             } catch {
                 s.recorder = nil
-                s.setStatus("Couldn't start recording: \(error.localizedDescription). If this is the first time, enable MB Clip Editor in System Settings ▸ Privacy & Security ▸ Screen Recording, then relaunch.", "err")
+                s.setStatus("Couldn't start recording: \(error.localizedDescription). If this is the first time, enable SimpleClips in System Settings ▸ Privacy & Security ▸ Screen Recording, then relaunch.", "err")
             }
         }
     }
@@ -957,9 +988,9 @@ struct ContentView: View {
         s.player.pause(); s.playing = false
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let dims = shellCapture("\(gFFprobe) -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 \"\(url.path)\"")
-            let durStr = shellCapture("\(gFFprobe) -v error -show_entries format=duration -of csv=p=0 \"\(url.path)\"")
-            let fpsStr = shellCapture("\(gFFprobe) -v error -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 \"\(url.path)\"")
+            let dims = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","csv=p=0", url.path])
+            let durStr = runTool(gFFprobe, ["-v","error","-show_entries","format=duration","-of","csv=p=0", url.path])
+            let fpsStr = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","csv=p=0", url.path])
             let parts = dims.split(separator: ",")
             let w = parts.count > 0 ? CGFloat(Int(parts[0]) ?? 0) : 0
             let h = parts.count > 1 ? CGFloat(Int(parts[1]) ?? 0) : 0
@@ -974,10 +1005,10 @@ struct ContentView: View {
             if s.isGif {
                 // Transcode GIF -> temp mp4 for smooth scrubbing.
                 let tmp = NSTemporaryDirectory() + "clipeditor_preview.mp4"
-                _ = shellCapture("\(gFFmpeg) -y -v error -i \"\(url.path)\" -movflags +faststart " +
-                                 "-vf \"scale=trunc(iw/2)*2:trunc(ih/2)*2\" -pix_fmt yuv420p \"\(tmp)\"")
+                _ = runTool(gFFmpeg, ["-y","-v","error","-i",url.path,"-movflags","+faststart",
+                                      "-vf","scale=trunc(iw/2)*2:trunc(ih/2)*2","-pix_fmt","yuv420p", tmp])
                 previewPath = tmp
-                if dur == 0 { dur = Double(shellCapture("\(gFFprobe) -v error -show_entries format=duration -of csv=p=0 \"\(tmp)\"")) ?? 0 }
+                if dur == 0 { dur = Double(runTool(gFFprobe, ["-v","error","-show_entries","format=duration","-of","csv=p=0", tmp])) ?? 0 }
             }
 
             DispatchQueue.main.async {
@@ -1041,10 +1072,11 @@ struct ContentView: View {
         try? FileManager.default.removeItem(atPath: base + ".srt")
         try? FileManager.default.removeItem(atPath: base + ".txt")
         // whisper wants 16 kHz mono PCM
-        _ = shellCapture("\(gFFmpeg) -y -v error -i \"\(input.path)\" -ss \(st) -t \(dur) -vn -ar 16000 -ac 1 -c:a pcm_s16le \"\(wav)\" 2>&1")
+        _ = runTool(gFFmpeg, ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(dur),
+                              "-vn","-ar","16000","-ac","1","-c:a","pcm_s16le", wav])
         guard fileBytes(wav) > 1000 else { return (nil, nil) }   // no audio track
-        let backendEnv = gGgmlBackends.isEmpty ? "" : "GGML_BACKEND_PATH=\"\(gGgmlBackends)\" "
-        _ = shellCapture("\(backendEnv)\(gWhisper) -m \"\(gWhisperModel)\" -f \"\(wav)\" -osrt -otxt -of \"\(base)\" 2>&1")
+        let env = gGgmlBackends.isEmpty ? [:] : ["GGML_BACKEND_PATH": gGgmlBackends]
+        _ = runTool(gWhisper, ["-m",gWhisperModel,"-f",wav,"-osrt","-otxt","-of",base], env: env)
         let srt = base + ".srt", txt = base + ".txt"
         return (fileBytes(srt) > 0 ? srt : nil, fileBytes(txt) > 0 ? txt : nil)
     }
@@ -1125,14 +1157,14 @@ struct ContentView: View {
                 DispatchQueue.main.async { s.setStatus("Exporting \(fmt) · \(quality)\(posLbl)…", "work") }
             }
             let p = plan(fmt, quality, crop, fpsOv)
-            let cmd = "\(gFFmpeg) -y -v error -i \"\(input.path)\" -ss \(st) -t \(durSel) -vf \"\(p.vf)\" \(p.codec) \"\(out.path)\""
-            let err = shellCapture(cmd + " 2>&1")
+            let err = runTool(gFFmpeg, ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),
+                                        "-vf",p.vf] + args(p.codec) + [out.path])
             // Embed a soft (toggleable) subtitle track for MP4 when requested.
             if burn, ext == "mp4", let srt = burnSrt, FileManager.default.fileExists(atPath: out.path) {
                 let tmp = out.path + ".subs.mp4"
-                _ = shellCapture("\(gFFmpeg) -y -v error -i \"\(out.path)\" -i \"\(srt)\" -map 0 -map 1 " +
-                                 "-c copy -c:s mov_text -metadata:s:s:0 language=eng -metadata:s:s:0 title=English " +
-                                 "-disposition:s:0 default \"\(tmp)\" 2>&1")
+                _ = runTool(gFFmpeg, ["-y","-v","error","-i",out.path,"-i",srt,"-map","0","-map","1",
+                                      "-c","copy","-c:s","mov_text","-metadata:s:s:0","language=eng",
+                                      "-metadata:s:s:0","title=English","-disposition:s:0","default", tmp])
                 if FileManager.default.fileExists(atPath: tmp) {
                     try? FileManager.default.removeItem(atPath: out.path)
                     try? FileManager.default.moveItem(atPath: tmp, toPath: out.path)
@@ -1177,8 +1209,8 @@ struct ContentView: View {
             func sample(_ f: String) -> Double {
                 let p = plan(f, quality, crop, fpsOv)
                 let o = tmp + "est." + (f == "GIF" ? "gif" : (f == "WEBM" ? "webm" : "mp4"))
-                _ = shellCapture("\(gFFmpeg) -y -v error -ss \(sampleStart) -i \"\(input.path)\" -t \(sampleDur) " +
-                                 "-vf \"\(p.vf)\" \(p.codec) \"\(o)\" 2>&1")
+                _ = runTool(gFFmpeg, ["-y","-v","error","-ss",String(sampleStart),"-i",input.path,"-t",String(sampleDur),
+                                      "-vf",p.vf] + args(p.codec) + [o])
                 return fileBytes(o)
             }
             var msg = ""
@@ -1211,19 +1243,16 @@ struct ContentView: View {
 
         let pw = plan("WEBM", s.quality, crop, fpsOverride())
         let pg = plan("GIF", s.quality, crop, fpsOverride())
-        let mk = "mkdir -p \"\(folder.path)\""
-        let webmCmd = "\(gFFmpeg) -y -v error -i \"\(input.path)\" -ss \(st) -t \(durSel) " +
-                      "-vf \"\(pw.vf)\" \(pw.codec) \"\(webm.path)\""
-        let gifCmd = "\(gFFmpeg) -y -v error -i \"\(input.path)\" -ss \(st) -t \(durSel) " +
-                     "-vf \"\(pg.vf)\" \"\(gif.path)\""
+        let webmArgs = ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pw.vf] + args(pw.codec) + [webm.path]
+        let gifArgs = ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pg.vf, gif.path]
 
         s.exporting = true
         s.setStatus("Exporting Web · \(s.quality) → \(base)_forweb…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
-            _ = shellCapture(mk)
-            let e1 = shellCapture(webmCmd + " 2>&1")
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let e1 = runTool(gFFmpeg, webmArgs)
             DispatchQueue.main.async { s.setStatus("webm done, building gif…", "work") }
-            let e2 = shellCapture(gifCmd + " 2>&1")
+            let e2 = runTool(gFFmpeg, gifArgs)
             DispatchQueue.main.async {
                 s.exporting = false
                 let okW = FileManager.default.fileExists(atPath: webm.path)
@@ -1255,7 +1284,7 @@ struct ClipEditorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject var state = EditorState()
     var body: some Scene {
-        WindowGroup("MB Clip Editor") { ContentView().environmentObject(state) }
+        WindowGroup("SimpleClips") { ContentView().environmentObject(state) }
             .windowResizability(.contentSize)
     }
 }

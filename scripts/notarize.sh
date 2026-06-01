@@ -11,7 +11,7 @@
 #          --apple-id you@example.com --team-id TEAMID --password <app-specific-password>
 #      (app-specific password from appleid.apple.com)
 #
-# Usage:  ./scripts/notarize.sh "build/Clip Editor.app"
+# Usage:  ./scripts/notarize.sh "build/SimpleClips.app"
 
 set -euo pipefail
 APP="${1:?usage: notarize.sh <App.app>}"

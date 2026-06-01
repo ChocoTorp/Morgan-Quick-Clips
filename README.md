@@ -1,104 +1,138 @@
 # SimpleClips
 
-A native macOS app for quickly turning screen recordings and almost any video
-file into trimmed, cropped, resized, captioned clips for sharing.
+SimpleClips is a native macOS app for turning screen recordings and existing video
+files into short, polished clips. Record or drop in footage, crop and trim it
+visually, set the exact output size, add captions, and export to the format you
+need. It runs entirely on your machine with no network access.
 
-- **Record the screen** (ScreenCaptureKit, in-process): full display, a specific
-  display (with on-screen "identify" numbers), or a draggable/resizable region box
-  that floats over fullscreen apps. Optional mic, system audio, and cursor.
-- **Drop in almost any video** — mp4, mov, m4v, gif, webm, mkv, avi, wmv, flv, ts,
-  mpg/mpeg, 3gp, f4v and more (single files or a batch queue). Formats AVKit can't
-  play natively get a fast hardware **proxy preview** automatically; editing/export
-  always run on the original.
-- **Visually crop** (4-corner handles) and **trim** on a timeline (chunky yellow
-  end handles with direction arrows).
-- **Resize precisely** — type the exact output pixels (aspect-locked to the crop,
-  capped at the crop size).
-- **Quality presets** — High fidelity / Balanced / High optimization. These only
-  change *compression*, never resolution (resolution is yours via the size fields).
-- **Set FPS** — keep the source frame rate or override it.
-- **Export** to MP4, GIF, WebM, **Web** (`webm` + `gif` in a `*_forweb` folder), or
-  MOV / M4V / MKV / AVI / WMV / FLV / TS / MPG / 3GP / F4V. One click to a chosen
-  export folder; auto-incrementing names (`clip`, `clip_1`, …) — never overwrites.
-- **Estimate size** before exporting, with the savings vs. the original
-  (e.g. "≈ 71.5 MB MP4 (was 106 MB MP4)").
-- **Captions** (whisper.cpp, offline): embed a toggleable subtitle track, save a
-  sidecar `.srt`, and/or save a plain-text `.txt` transcript.
+## For video editors
 
-100% offline — no network access at all. External tools (ffmpeg/whisper) are run
-via argument arrays (no shell), so filenames can't inject commands.
+**Record your screen.** Capture a full display, pick a specific monitor (on-screen
+numbers tell you which is which), or drag a resizable box over just the region you
+want. The box floats above fullscreen apps. You can include the cursor, your
+microphone, and system audio.
 
-It's a single Swift file (`Sources/ClipEditor.swift`) compiled with `swiftc`.
+**Bring in almost any video.** Drop in MP4, MOV, M4V, GIF, WebM, MKV, AVI, WMV, FLV,
+TS, MPG/MPEG, 3GP, F4V, and more, one file or a whole batch. Formats macOS can't play
+back natively get a fast preview proxy automatically, so scrubbing always works. Your
+original file is never modified; all editing and export run on it directly.
+
+**Crop and trim.** Drag the four corner handles to crop. Drag the yellow end handles
+on the timeline to trim (each has an arrow showing which way it moves).
+
+**Set the output size exactly.** Type the output width or height in pixels. The other
+dimension follows the crop's aspect ratio automatically, and you can't upscale past
+the crop, so you only ever resize down from real pixels.
+
+**Pick a quality target.** High fidelity, Balanced, or High optimization. These change
+compression only and never touch resolution, so the size you set is the size you get.
+High fidelity favors detail over file size; High optimization favors small files.
+
+**Set the frame rate** if you want, or keep the source.
+
+**Add captions, generated locally.** Transcription runs offline with Whisper. Embed a
+toggleable subtitle track in the MP4, save a sidecar `.srt`, and/or save a plain
+`.txt` transcript.
+
+**Export to whatever you need.** MP4, GIF, WebM, a Web bundle (a `.webm` plus a `.gif`
+in a `*_forweb` folder), or MOV, M4V, MKV, AVI, WMV, FLV, TS, MPG, 3GP, F4V. One click
+drops the file into your chosen folder with auto-numbered names (`clip`, `clip_1`, and
+so on) and never overwrites. Run **Estimate size** first to preview the result and how
+much smaller it is than the source, for example `71.5 MB MP4 (was 106 MB MP4)`.
+
+## For developers
+
+Architecture:
+
+- One Swift file (`Sources/ClipEditor.swift`), SwiftUI plus AppKit, built with
+  `swiftc`. There is no Xcode project.
+- Screen capture uses ScreenCaptureKit in-process (`SCStream` plus
+  `SCRecordingOutput`), so the permission attaches to the app and the recorder writes
+  the movie itself.
+- All media work calls `ffmpeg`, `ffprobe`, and `whisper-cli` through `Process` with
+  argument arrays, never a shell string, so filenames and paths cannot inject
+  commands.
+- Transcription runs offline against a bundled GGML model; the ggml compute backends
+  (CPU, Metal, BLAS) load from inside the app.
+- No networking anywhere. The app opens zero connections.
+
+`plan()` is the single source of truth for encode settings, shared by export and the
+size estimator so the estimate matches the real output. The quality presets map to
+codec settings (CRF, preset, bitrate) and never to scaling; resolution comes only from
+the crop and the output-size fields.
 
 ## Build
 
-Two modes:
-
 ```bash
-# Dev build — compiles only; uses Homebrew ffmpeg/whisper at runtime.
+# Dev build: compiles only, uses Homebrew ffmpeg/whisper at runtime.
 brew install ffmpeg whisper-cpp dylibbundler
-./scripts/fetch-model.sh           # downloads the Whisper model (~142 MB)
-./build.sh                         # → build/SimpleClips.app (ad-hoc)
+./scripts/fetch-model.sh           # downloads the Whisper model (about 142 MB)
+./build.sh                         # writes build/SimpleClips.app (ad-hoc signed)
 
-# Self-contained build — bundles ffmpeg/whisper/backends + model INTO the app.
-./build.sh --bundle                # → build/SimpleClips.app (~182 MB, runs with no Homebrew)
+# Self-contained build: bundles ffmpeg, whisper, the ggml backends, and the model.
+./build.sh --bundle                # about 182 MB, runs with no Homebrew present
 open "build/SimpleClips.app"
 ```
 
-Requires Xcode command line tools (`swiftc`) + macOS 15+ SDK. `--bundle` also needs
-`dylibbundler` and the Homebrew tools/model present on the **build** machine (they
-get copied in). Verified: with `--bundle`, the app runs ffmpeg + whisper + the ggml
-compute backends entirely from inside the bundle, with no Homebrew and an empty PATH.
+You need the Xcode command line tools (`swiftc`) and the macOS 15+ SDK. The `--bundle`
+build also needs `dylibbundler` plus the Homebrew tools and the model on the build
+machine, which get copied into the app. This has been verified: with `--bundle`,
+ffmpeg, whisper, and the ggml compute backends all run from inside the bundle with an
+empty PATH and no Homebrew.
 
-## How self-containment works (`--bundle`)
+### How self-containment works (`--bundle`)
 
-`scripts/bundle-deps.sh` copies the tools into the app and rewrites their dylib
-links so nothing points at Homebrew:
+`scripts/bundle-deps.sh` copies the tools into the app and rewrites their dylib load
+paths so nothing points back at Homebrew:
 
 ```
 Contents/Helpers/      ffmpeg, ffprobe, whisper-cli, libggml-*.so (compute backends)
-Contents/Frameworks/   all dependent dylibs (libav*, x264/x265, libggml*, libomp, …)
+Contents/Frameworks/   dependent dylibs (libav*, x264/x265, libggml*, libomp, etc.)
 Contents/Resources/    ggml-base.en.bin (Whisper model), AppIcon.icns
 ```
 
-The code (`resolveTools()`) loads tools/model from the bundle when present and
-falls back to Homebrew for dev builds. ggml backend plugins sit next to
-`whisper-cli` so ggml auto-discovers them on any machine.
+`resolveTools()` loads the tools and model from the bundle when present and falls back
+to Homebrew for dev builds. The ggml backend plugins sit next to `whisper-cli` so ggml
+discovers them on any machine.
 
-> Captions are **soft/embedded** subtitles (`mov_text`) + sidecar `.srt`/`.txt`.
-> True burn-in needs an ffmpeg with `libass`, which the bundled ffmpeg lacks.
+Captions use soft, embedded subtitles (`mov_text`) plus the sidecar `.srt` and `.txt`.
+Burned-in captions need an ffmpeg built with `libass`, which the bundled ffmpeg does
+not include.
 
-## Remaining steps before public download
+## Shipping it for download
 
-The app is now **self-contained**, but to host it for others you still need:
+The app is self-contained. To distribute it to other people you still need:
 
-1. **Apple Developer Program** → a *Developer ID Application* certificate.
-2. **Sign + notarize:**
+1. An Apple Developer Program membership, which provides a Developer ID Application
+   certificate.
+2. A signed and notarized build:
    ```bash
    SIGN_ID="Developer ID Application: Your Name (TEAMID)" ./build.sh --bundle
    ./scripts/notarize.sh "build/SimpleClips.app"
    ```
-   (`build.sh` applies the hardened runtime + `Resources/entitlements.plist`;
-   `notarize.sh` submits to Apple and staples the ticket.)
-3. **Architecture** — built `arm64` only (bundled tools are arm64).
-4. **macOS 15+** required (ScreenCaptureKit `SCRecordingOutput`).
-5. **Licensing** — the bundled ffmpeg (x264/x265) makes the distribution **GPL**;
-   provide the corresponding source/offer when you publish.
+   `build.sh` applies the hardened runtime and `Resources/entitlements.plist` when it
+   sees a Developer ID (or `NOTARIZE=1`); `notarize.sh` submits to Apple and staples
+   the ticket. Local and self-signed builds use plain signing with no timestamp.
+3. A universal build if you want Intel support. The current build is arm64 only,
+   because the bundled tools are arm64.
+4. macOS 15 or later (ScreenCaptureKit `SCRecordingOutput`).
+5. Compliance with ffmpeg's license. Bundling ffmpeg built with x264/x265 makes the
+   distribution GPL, so provide the corresponding source or a written offer.
 
 ## Layout
 
 ```
-Sources/ClipEditor.swift     # the whole app
-Resources/AppIcon.icns       # app icon
-Resources/entitlements.plist # hardened-runtime entitlements (for notarization)
-build.sh                     # compile + (optional) bundle + sign
-scripts/bundle-deps.sh       # bundle ffmpeg/whisper/backends/model into the .app
-scripts/fetch-model.sh       # download the Whisper model
-scripts/notarize.sh          # notarize + staple (after you have a Developer ID)
+Sources/ClipEditor.swift     the whole app
+Resources/AppIcon.icns       app icon
+Resources/entitlements.plist hardened-runtime entitlements (notarization)
+build.sh                     compile, optionally bundle, sign
+scripts/bundle-deps.sh       bundle ffmpeg/whisper/backends/model into the app
+scripts/fetch-model.sh       download the Whisper model
+scripts/notarize.sh          notarize and staple (after you have a Developer ID)
 ```
 
 ## Licensing
 
-App code: your choice. Bundled/used third-party: **ffmpeg** (LGPL/GPL depending on
-build), **whisper.cpp** (MIT), Whisper models (MIT). Review obligations before
-redistributing binaries.
+The app code is yours to license. Third-party components: ffmpeg (LGPL or GPL
+depending on the build), whisper.cpp (MIT), and the Whisper models (MIT). Review those
+obligations before redistributing binaries.

@@ -1,0 +1,10 @@
+# build output
+build/
+*.app
+
+# models (large; fetch with scripts/fetch-model.sh)
+*.bin
+models/
+
+# macOS cruft
+.DS_Store

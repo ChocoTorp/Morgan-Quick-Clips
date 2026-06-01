@@ -225,10 +225,10 @@ final class EditorState: ObservableObject {
     @Published var estimating = false
     @Published var status = "Drop a .mp4 or .gif to begin."
     @Published var statusKind = "info"   // info | work | ok | err
-    @Published var outFormat = "Same as input"
+    @Published var outFormat = "MP4"   // set to the detected input type on load
     @Published var quality = "Balanced"   // Fidelity | Balanced | Optimized
     @Published var outName = ""
-    @Published var scale = "1.0"           // 0–1 output scale (0.5 = half dimensions)
+    @Published var scale = "100"           // output scale as a percent (max 100)
     @Published var srcFps: Double = 0      // source frame rate
     @Published var fpsOn = false           // override fps?
     @Published var fpsText = ""            // target fps when overriding
@@ -693,7 +693,14 @@ struct ContentView: View {
                 Text("\(mmss(s.current)) / \(mmss(s.duration))").font(.system(size: 11, design: .monospaced))
                 Spacer()
                 if s.srcW > 0 {
-                    Text("Crop \(Int(s.cropW))×\(Int(s.cropH)) → out \(outW)×\(outH)")
+                    Text("Crop \(Int(s.cropW))×\(Int(s.cropH))")
+                        .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                    Text("Scale").font(.system(size: 11)).foregroundColor(.secondary)
+                    TextField("100", text: $s.scale)
+                        .textFieldStyle(.roundedBorder).frame(width: 44).disabled(s.exporting)
+                        .help("Output size as a percent of the crop (max 100%).")
+                    Text("%").font(.system(size: 11)).foregroundColor(.secondary)
+                    Text("→ \(outW)×\(outH)")
                         .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
                     Button("Reset crop") { s.resetCropFull() }.font(.system(size: 11))
                 }
@@ -734,24 +741,19 @@ struct ContentView: View {
                 Text("Name").font(.system(size: 11)).foregroundColor(.secondary)
                 TextField("output name", text: $s.outName)
                     .textFieldStyle(.roundedBorder).frame(width: 170).disabled(s.exporting)
-                Text("Scale").font(.system(size: 11)).foregroundColor(.secondary)
-                TextField("1.0", text: $s.scale)
-                    .textFieldStyle(.roundedBorder).frame(width: 48).disabled(s.exporting)
-                    .help("Output scale 0–1 (e.g. 0.5 = half size)")
-                Toggle("FPS", isOn: $s.fpsOn).toggleStyle(.checkbox).disabled(s.exporting)
+                Toggle("Set FPS", isOn: $s.fpsOn).toggleStyle(.checkbox).disabled(s.exporting)
                     .help("Override frame rate. Off = keep source fps.")
                 TextField(s.srcFps > 0 ? String(Int(s.srcFps.rounded())) : "fps", text: $s.fpsText)
                     .textFieldStyle(.roundedBorder).frame(width: 44)
                     .disabled(!s.fpsOn || s.exporting)
-                Picker("", selection: $s.outFormat) {
-                    Text("Same as input").tag("Same as input")
-                    Text("MP4").tag("MP4")
-                    Text("GIF").tag("GIF")
-                    Text("Web (webm + gif)").tag("Web")
-                }.frame(width: 170).labelsHidden().disabled(s.exporting)
                 Spacer()
                 Button("Estimate size") { estimateSize() }
                     .disabled(s.inputURL == nil || s.exporting || s.estimating)
+                Picker("", selection: $s.outFormat) {
+                    Text("MP4").tag("MP4")
+                    Text("GIF").tag("GIF")
+                    Text("Web (webm + gif)").tag("Web")
+                }.frame(width: 150).labelsHidden().disabled(s.exporting)
                 Button(action: { chooseExportFolder() }) {
                     Label(s.exportFolder.lastPathComponent, systemImage: "folder")
                 }.disabled(s.exporting).help("Set export location (currently: \(s.exportFolder.path))")
@@ -1024,6 +1026,7 @@ struct ContentView: View {
                 s.srcFps = fps
                 if !s.fpsOn { s.fpsText = fps > 0 ? String(Int(fps.rounded())) : "" }
                 s.outName = "clip"
+                s.outFormat = s.isGif ? "GIF" : "MP4"   // default to the detected input type
                 s.setStatus("\(Int(w))×\(Int(h)), \(mmss(dur)) — drag the yellow box to crop, the handles to trim.", "info")
             }
         }
@@ -1037,9 +1040,10 @@ struct ContentView: View {
         return min(v, 240)
     }
 
-    // User scale factor, clamped to (0, 1]. Invalid/0 → 1.0 (no scaling).
+    // Scale is a PERCENT of the crop (max 100). Returns a 0–1 factor; invalid/0 → 1.0.
     func scaleFactor() -> Double {
-        let f = Double(s.scale.trimmingCharacters(in: .whitespaces)) ?? 1.0
+        let pct = Double(s.scale.trimmingCharacters(in: .whitespaces)) ?? 100
+        let f = pct / 100
         return f <= 0 ? 1.0 : min(f, 1.0)
     }
 
@@ -1123,8 +1127,7 @@ struct ContentView: View {
         if s.outFormat == "Web" { exportWeb(input); return }
         let (crop, st, durSel) = cropTrim()
 
-        var fmt = s.outFormat
-        if fmt == "Same as input" { fmt = s.isGif ? "GIF" : "MP4" }
+        let fmt = s.outFormat
         let ext = fmt == "GIF" ? "gif" : "mp4"
         let nm = s.outName.isEmpty ? input.deletingPathExtension().lastPathComponent : s.outName
 
@@ -1196,8 +1199,7 @@ struct ContentView: View {
         let sampleDur = min(4.0, max(0.5, durSel))
         let sampleStart = st + max(0, (durSel - sampleDur) * 0.25)
         let factor = durSel / sampleDur
-        var fmt = s.outFormat
-        if fmt == "Same as input" { fmt = s.isGif ? "GIF" : "MP4" }
+        let fmt = s.outFormat
         let tmp = NSTemporaryDirectory()
 
         s.estimating = true

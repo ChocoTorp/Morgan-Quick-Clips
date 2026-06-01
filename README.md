@@ -1,19 +1,32 @@
 # SimpleClips
 
-A native macOS app for quickly turning screen recordings and video/GIF files into
-trimmed, cropped, scaled, captioned clips for sharing.
+A native macOS app for quickly turning screen recordings and almost any video
+file into trimmed, cropped, resized, captioned clips for sharing.
 
 - **Record the screen** (ScreenCaptureKit, in-process): full display, a specific
-  display, or a draggable region box that floats over fullscreen apps. Optional
-  mic, system audio, and cursor.
-- **Drop in** `.mp4` / `.gif` (or a batch/queue of them).
-- **Visually crop** (4-corner handles), **trim** on a timeline, **scale** (0–1),
-  and pick a **quality preset** (High fidelity / Balanced / High optimization).
-- **Export** to MP4 / GIF / WebM, or **Web** (`webm` + `gif` in a `*_forweb` folder).
-  One-click to a chosen export folder; auto-incrementing names (`clip`, `clip_1`, …).
-- **Estimate size** before exporting.
-- **Captions** (whisper.cpp): embed a toggleable subtitle track, save a sidecar
-  `.srt`, and/or save a plain-text `.txt` transcript.
+  display (with on-screen "identify" numbers), or a draggable/resizable region box
+  that floats over fullscreen apps. Optional mic, system audio, and cursor.
+- **Drop in almost any video** — mp4, mov, m4v, gif, webm, mkv, avi, wmv, flv, ts,
+  mpg/mpeg, 3gp, f4v and more (single files or a batch queue). Formats AVKit can't
+  play natively get a fast hardware **proxy preview** automatically; editing/export
+  always run on the original.
+- **Visually crop** (4-corner handles) and **trim** on a timeline (chunky yellow
+  end handles with direction arrows).
+- **Resize precisely** — type the exact output pixels (aspect-locked to the crop,
+  capped at the crop size).
+- **Quality presets** — High fidelity / Balanced / High optimization. These only
+  change *compression*, never resolution (resolution is yours via the size fields).
+- **Set FPS** — keep the source frame rate or override it.
+- **Export** to MP4, GIF, WebM, **Web** (`webm` + `gif` in a `*_forweb` folder), or
+  MOV / M4V / MKV / AVI / WMV / FLV / TS / MPG / 3GP / F4V. One click to a chosen
+  export folder; auto-incrementing names (`clip`, `clip_1`, …) — never overwrites.
+- **Estimate size** before exporting, with the savings vs. the original
+  (e.g. "≈ 71.5 MB MP4 (was 106 MB MP4)").
+- **Captions** (whisper.cpp, offline): embed a toggleable subtitle track, save a
+  sidecar `.srt`, and/or save a plain-text `.txt` transcript.
+
+100% offline — no network access at all. External tools (ffmpeg/whisper) are run
+via argument arrays (no shell), so filenames can't inject commands.
 
 It's a single Swift file (`Sources/ClipEditor.swift`) compiled with `swiftc`.
 

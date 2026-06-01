@@ -97,32 +97,56 @@ func fileBytes(_ path: String) -> Double {
 func plan(_ format: String, _ quality: String, _ crop: String, _ fps: Int?) -> (vf: String, codec: String) {
     let rate = (fps != nil) ? " -r \(fps!)" : ""
     switch format {
+    // NOTE: quality presets only change compression — they NEVER alter resolution.
+    // Output size is controlled entirely by the user's crop + output-size fields
+    // (already baked into `crop`).
     case "GIF":
-        let gfps: Int, maxw: Int, pal: String, use: String
+        let gfps: Int, pal: String, use: String
         switch quality {
-        case "Fidelity":  gfps = 20; maxw = 800; pal = "palettegen=stats_mode=full"; use = "paletteuse=dither=sierra2_4a"
-        case "Optimized": gfps = 12; maxw = 480; pal = "palettegen=max_colors=128:stats_mode=diff"; use = "paletteuse=dither=bayer:bayer_scale=2"
-        default:          gfps = 15; maxw = 640; pal = "palettegen=stats_mode=diff"; use = "paletteuse=dither=bayer"
+        case "Fidelity":  gfps = 20; pal = "palettegen=stats_mode=full"; use = "paletteuse=dither=sierra2_4a"
+        case "Optimized": gfps = 12; pal = "palettegen=max_colors=128:stats_mode=diff"; use = "paletteuse=dither=bayer:bayer_scale=2"
+        default:          gfps = 15; pal = "palettegen=stats_mode=diff"; use = "paletteuse=dither=bayer"
         }
-        let vf = "\(crop),fps=\(fps ?? gfps),scale='min(\(maxw),iw)':-1:flags=lanczos," +
-                 "split[a][b];[a]\(pal)[p];[b][p]\(use)"
+        let vf = "\(crop),fps=\(fps ?? gfps),split[a][b];[a]\(pal)[p];[b][p]\(use)"
         return (vf, "")
     case "WEBM":
-        var vf = crop; var crf = 32; var ab = 128; var extra = "-row-mt 1"
+        var crf = 32; var ab = 128; var extra = "-row-mt 1"
         switch quality {
-        case "Fidelity":  crf = 24; ab = 160
-        case "Optimized": crf = 40; ab = 96; extra = "-row-mt 1 -deadline good -cpu-used 3"; vf = "\(crop),scale=-2:'min(720,ih)'"
+        case "Fidelity":  crf = 18; ab = 192     // detail first; size not a concern
+        case "Optimized": crf = 40; ab = 96; extra = "-row-mt 1 -deadline good -cpu-used 3"
         default: break
         }
-        return (vf, "-c:v libvpx-vp9 -crf \(crf) -b:v 0 \(extra) -pix_fmt yuv420p\(rate) -c:a libopus -b:a \(ab)k")
-    default: // MP4
-        var vf = crop; var crf = 22; var preset = "medium"; var ab = 128
+        return (crop, "-c:v libvpx-vp9 -crf \(crf) -b:v 0 \(extra) -pix_fmt yuv420p\(rate) -c:a libopus -b:a \(ab)k")
+    case "MPG":   // MPEG-1/2 program stream
+        var q = 5
+        switch quality { case "Fidelity": q = 2; case "Optimized": q = 7; default: break }
+        return (crop, "-c:v mpeg2video -q:v \(q)\(rate) -c:a mp2 -b:a 192k")
+    case "WMV":
+        var q = 4
+        switch quality { case "Fidelity": q = 2; case "Optimized": q = 6; default: break }
+        return (crop, "-c:v wmv2 -q:v \(q)\(rate) -c:a wmav2 -b:a 192k")
+    default:      // H.264/AAC family of containers: MP4, MOV, M4V, MKV, AVI, TS, FLV, F4V, 3GP
+        var crf = 22; var preset = "medium"; var ab = 128
         switch quality {
-        case "Fidelity":  crf = 16; preset = "slow"; ab = 192
-        case "Optimized": crf = 30; preset = "slower"; ab = 96; vf = "\(crop),scale=-2:'min(720,ih)'"
+        case "Fidelity":  crf = 14; preset = "slow"; ab = 256   // detail first; size not a concern
+        case "Optimized": crf = 30; preset = "slower"; ab = 96
         default: break
         }
-        return (vf, "-c:v libx264 -crf \(crf) -preset \(preset) -pix_fmt yuv420p\(rate) -c:a aac -b:a \(ab)k -movflags +faststart")
+        let profile = (format == "3GP") ? " -profile:v baseline -level 3.1" : ""
+        let fast = ["MP4","MOV","M4V"].contains(format) ? " -movflags +faststart" : ""
+        return (crop, "-c:v libx264 -crf \(crf) -preset \(preset)\(profile) -pix_fmt yuv420p\(rate) -c:a aac -b:a \(ab)k\(fast)")
+    }
+}
+
+// Output file extension for a format tag.
+func extFor(_ format: String) -> String {
+    switch format {
+    case "GIF": return "gif"
+    case "WEBM": return "webm"
+    case "MOV": return "mov"; case "M4V": return "m4v"; case "MKV": return "mkv"
+    case "AVI": return "avi"; case "WMV": return "wmv"; case "FLV": return "flv"
+    case "TS": return "ts"; case "MPG": return "mpg"; case "3GP": return "3gp"; case "F4V": return "f4v"
+    default: return "mp4"
     }
 }
 
@@ -228,7 +252,9 @@ final class EditorState: ObservableObject {
     @Published var outFormat = "MP4"   // set to the detected input type on load
     @Published var quality = "Balanced"   // Fidelity | Balanced | Optimized
     @Published var outName = ""
-    @Published var scale = "100"           // output scale as a percent (max 100)
+    // Output pixel size (aspect-locked to the crop). Defaults to the crop size.
+    @Published var outW: Int = 0
+    @Published var outH: Int = 0
     @Published var srcFps: Double = 0      // source frame rate
     @Published var fpsOn = false           // override fps?
     @Published var fpsText = ""            // target fps when overriding
@@ -261,7 +287,12 @@ final class EditorState: ObservableObject {
     var previewURL: URL?
     var timeObserver: Any?
 
-    func resetCropFull() { cropX = 0; cropY = 0; cropW = srcW; cropH = srcH }
+    func resetCropFull() { cropX = 0; cropY = 0; cropW = srcW; cropH = srcH; syncOutToCrop() }
+    // Output size follows the crop (even dims). Called whenever the crop changes.
+    func syncOutToCrop() {
+        func ev(_ v: CGFloat) -> Int { let i = Int(v.rounded()); return max(2, i - i % 2) }
+        outW = ev(cropW); outH = ev(cropH)
+    }
 
     func attachObserver() {
         if let o = timeObserver { player.removeTimeObserver(o); timeObserver = nil }
@@ -600,6 +631,7 @@ struct ContentView: View {
     @EnvironmentObject var s: EditorState
     @State private var dropTargeted = false
     @State private var screenMenuOpen = false
+    @FocusState private var outFocus: Int?   // 1 = width field, 2 = height field
 
     var body: some View {
         VStack(spacing: 10) {
@@ -693,18 +725,32 @@ struct ContentView: View {
                 Text("\(mmss(s.current)) / \(mmss(s.duration))").font(.system(size: 11, design: .monospaced))
                 Spacer()
                 if s.srcW > 0 {
-                    Text("Crop \(Int(s.cropW))×\(Int(s.cropH))")
+                    let cw = evenInt(s.cropW), ch = evenInt(s.cropH)
+                    let aspect = ch > 0 ? Double(cw) / Double(ch) : 1
+                    Text("Crop \(cw)×\(ch)  →")
                         .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                    Text("Scale").font(.system(size: 11)).foregroundColor(.secondary)
-                    TextField("100", text: $s.scale)
-                        .textFieldStyle(.roundedBorder).frame(width: 44).disabled(s.exporting)
-                        .help("Output size as a percent of the crop (max 100%).")
-                    Text("%").font(.system(size: 11)).foregroundColor(.secondary)
-                    Text("→ \(outW)×\(outH)")
-                        .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                    // Output pixels — editing one field auto-adjusts the other (aspect locked).
+                    // Capped at the crop size: you can downscale, never upscale past it.
+                    TextField("", value: Binding(
+                        get: { s.outW },
+                        set: { v in let w = min(cw, max(2, v - v % 2)); s.outW = w
+                                    let h = Int((Double(w) / aspect).rounded()); s.outH = min(ch, max(2, h - h % 2)) }),
+                        format: .number).textFieldStyle(.roundedBorder).frame(width: 56)
+                        .disabled(s.exporting).focused($outFocus, equals: 1)
+                    Text("×").font(.system(size: 11)).foregroundColor(.secondary)
+                    TextField("", value: Binding(
+                        get: { s.outH },
+                        set: { v in let h = min(ch, max(2, v - v % 2)); s.outH = h
+                                    let w = Int((Double(h) * aspect).rounded()); s.outW = min(cw, max(2, w - w % 2)) }),
+                        format: .number).textFieldStyle(.roundedBorder).frame(width: 56)
+                        .disabled(s.exporting).focused($outFocus, equals: 2)
+                    Text("px").font(.system(size: 11)).foregroundColor(.secondary)
                     Button("Reset crop") { s.resetCropFull() }.font(.system(size: 11))
                 }
             }
+            // keep output size following the crop while you adjust the crop box
+            .onChange(of: s.cropW) { _ in s.syncOutToCrop() }
+            .onChange(of: s.cropH) { _ in s.syncOutToCrop() }
 
             Timeline().environmentObject(s)
 
@@ -750,10 +796,25 @@ struct ContentView: View {
                 Button("Estimate size") { estimateSize() }
                     .disabled(s.inputURL == nil || s.exporting || s.estimating)
                 Picker("", selection: $s.outFormat) {
-                    Text("MP4").tag("MP4")
-                    Text("GIF").tag("GIF")
-                    Text("Web (webm + gif)").tag("Web")
-                }.frame(width: 150).labelsHidden().disabled(s.exporting)
+                    Section {
+                        Text("MP4").tag("MP4")
+                        Text("GIF").tag("GIF")
+                        Text("WebM").tag("WEBM")
+                        Text("Web (webm + gif)").tag("Web")
+                    }
+                    Section("More formats") {
+                        Text("MOV").tag("MOV")
+                        Text("M4V").tag("M4V")
+                        Text("MKV").tag("MKV")
+                        Text("AVI").tag("AVI")
+                        Text("WMV").tag("WMV")
+                        Text("FLV").tag("FLV")
+                        Text("MPEG-TS (.ts)").tag("TS")
+                        Text("MPEG (.mpg)").tag("MPG")
+                        Text("3GP").tag("3GP")
+                        Text("F4V").tag("F4V")
+                    }
+                }.frame(width: 160).labelsHidden().disabled(s.exporting)
                 Button(action: { chooseExportFolder() }) {
                     Label(s.exportFolder.lastPathComponent, systemImage: "folder")
                 }.disabled(s.exporting).help("Set export location (currently: \(s.exportFolder.path))")
@@ -766,17 +827,17 @@ struct ContentView: View {
         }
         .padding(14)
         .frame(minWidth: 780, minHeight: 640)
+        .contentShape(Rectangle())
+        .onTapGesture { outFocus = nil }   // click anywhere outside the fields to deselect
         .onAppear { enumerateScreens() }
     }
 
-    // Output dimensions after crop + scale (even, matching the crop filter).
-    var outW: Int { let v = Int((s.cropW * CGFloat(scaleFactor())).rounded()); return max(2, v - v % 2) }
-    var outH: Int { let v = Int((s.cropH * CGFloat(scaleFactor())).rounded()); return max(2, v - v % 2) }
+    func evenInt(_ v: CGFloat) -> Int { let i = Int(v.rounded()); return max(2, i - i % 2) }
 
     var qualityHint: String {
         switch s.quality {
-        case "Fidelity":  return "Retain detail — high quality, larger files, no downscaling."
-        case "Optimized": return "Smallest reasonable — stronger compression, caps to 720p."
+        case "Fidelity":  return "Preserves maximum detail — file size is not a concern."
+        case "Optimized": return "Smallest reasonable — stronger compression."
         default:          return "Balanced — slight compression at near-original quality."
         }
     }
@@ -807,7 +868,11 @@ struct ContentView: View {
 
     // MARK: queue
 
-    static let acceptedExts: Set<String> = ["mp4","gif","mov","mkv","m4v","webm","avi","mpg","mpeg","ts","wmv","3gp","m2ts"]
+    static let acceptedExts: Set<String> = [
+        "mp4","mov","m4v","gif","webm","mkv","avi","wmv","flv","ts","mts","m2ts",
+        "mpg","mpeg","m2v","3gp","3g2","ogv","vob","asf","f4v","divx","qt","mxf","dv","y4m"]
+    // AVPlayer can play these directly; anything else gets a proxy preview transcode.
+    static let nativePreviewExts: Set<String> = ["mp4","mov","m4v"]
 
     func videoFiles(in dir: URL) -> [URL] {
         let items = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
@@ -1003,12 +1068,17 @@ struct ContentView: View {
             if fp.count == 2, let n = Double(fp[0]), let d = Double(fp[1]), d > 0 { fps = n / d }
             else { fps = Double(fpsStr) ?? 0 }
 
+            // AVPlayer only decodes mp4/mov/m4v. For anything else (webm, mkv, avi,
+            // gif, wmv, …) make a fast hardware proxy mp4 so the preview/scrubbing
+            // works. Editing/export still run on the ORIGINAL file at full quality.
             var previewPath = url.path
-            if s.isGif {
-                // Transcode GIF -> temp mp4 for smooth scrubbing.
-                let tmp = NSTemporaryDirectory() + "clipeditor_preview.mp4"
-                _ = runTool(gFFmpeg, ["-y","-v","error","-i",url.path,"-movflags","+faststart",
-                                      "-vf","scale=trunc(iw/2)*2:trunc(ih/2)*2","-pix_fmt","yuv420p", tmp])
+            let ext = url.pathExtension.lowercased()
+            if !Self.nativePreviewExts.contains(ext) {
+                let tmp = NSTemporaryDirectory() + "scpreview_\(abs(url.path.hashValue)).mp4"
+                _ = runTool(gFFmpeg, ["-y","-v","error","-i",url.path,
+                                      "-vf","scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                                      "-c:v","h264_videotoolbox","-b:v","8M","-pix_fmt","yuv420p",
+                                      "-c:a","aac","-movflags","+faststart", tmp])
                 previewPath = tmp
                 if dur == 0 { dur = Double(runTool(gFFprobe, ["-v","error","-show_entries","format=duration","-of","csv=p=0", tmp])) ?? 0 }
             }
@@ -1026,7 +1096,8 @@ struct ContentView: View {
                 s.srcFps = fps
                 if !s.fpsOn { s.fpsText = fps > 0 ? String(Int(fps.rounded())) : "" }
                 s.outName = "clip"
-                s.outFormat = s.isGif ? "GIF" : "MP4"   // default to the detected input type
+                // default output to the detected input type
+                s.outFormat = (ext == "gif") ? "GIF" : (ext == "webm" ? "WEBM" : "MP4")
                 s.setStatus("\(Int(w))×\(Int(h)), \(mmss(dur)) — drag the yellow box to crop, the handles to trim.", "info")
             }
         }
@@ -1040,15 +1111,8 @@ struct ContentView: View {
         return min(v, 240)
     }
 
-    // Scale is a PERCENT of the crop (max 100). Returns a 0–1 factor; invalid/0 → 1.0.
-    func scaleFactor() -> Double {
-        let pct = Double(s.scale.trimmingCharacters(in: .whitespaces)) ?? 100
-        let f = pct / 100
-        return f <= 0 ? 1.0 : min(f, 1.0)
-    }
-
-    // Even crop dims for yuv420p, clamped to source, plus optional scale.
-    // Returns the "crop=…[,scale=…]" filter, start, dur.
+    // Even crop dims for yuv420p, clamped to source, then scale to the user's
+    // chosen output pixels (aspect-locked to the crop). Returns "crop=…[,scale=…]".
     func cropTrim() -> (crop: String, st: Double, dur: Double) {
         var cw = Int(s.cropW.rounded()), ch = Int(s.cropH.rounded())
         var cx = Int(s.cropX.rounded()), cy = Int(s.cropY.rounded())
@@ -1057,10 +1121,9 @@ struct ContentView: View {
         if cy + ch > Int(s.srcH) { cy = Int(s.srcH) - ch }
         cx = max(0, cx); cy = max(0, cy)
         var f = "crop=\(cw):\(ch):\(cx):\(cy)"
-        let sf = scaleFactor()
-        if abs(sf - 1.0) > 0.001 {
-            // trunc(.../2)*2 keeps dimensions even (required by yuv420p; harmless for gif)
-            f += ",scale=trunc(iw*\(sf)/2)*2:trunc(ih*\(sf)/2)*2"
+        let ow = max(2, s.outW - s.outW % 2), oh = max(2, s.outH - s.outH % 2)
+        if s.outW > 0, s.outH > 0, ow != cw || oh != ch {
+            f += ",scale=\(ow):\(oh):flags=lanczos"
         }
         return (f, s.trimStart, max(0.05, s.trimEnd - s.trimStart))
     }
@@ -1128,7 +1191,7 @@ struct ContentView: View {
         let (crop, st, durSel) = cropTrim()
 
         let fmt = s.outFormat
-        let ext = fmt == "GIF" ? "gif" : "mp4"
+        let ext = extFor(fmt)
         let nm = s.outName.isEmpty ? input.deletingPathExtension().lastPathComponent : s.outName
 
         // One-click: write straight into the chosen export folder, never overwriting.
@@ -1206,11 +1269,13 @@ struct ContentView: View {
         s.setStatus("Estimating \(fmt) size…", "work")
         let quality = s.quality
         let fpsOv = fpsOverride()
+        // Original file size, to show the savings ("… (was 106 MB MP4)").
+        let wasStr = " (was \(humanSize(fileBytes(input.path))) \(input.pathExtension.uppercased()))"
         DispatchQueue.global(qos: .userInitiated).async {
             // Encode a sample with the SAME plan() settings export will use.
             func sample(_ f: String) -> Double {
                 let p = plan(f, quality, crop, fpsOv)
-                let o = tmp + "est." + (f == "GIF" ? "gif" : (f == "WEBM" ? "webm" : "mp4"))
+                let o = tmp + "est." + extFor(f)
                 _ = runTool(gFFmpeg, ["-y","-v","error","-ss",String(sampleStart),"-i",input.path,"-t",String(sampleDur),
                                       "-vf",p.vf] + args(p.codec) + [o])
                 return fileBytes(o)
@@ -1218,14 +1283,15 @@ struct ContentView: View {
             var msg = ""
             switch fmt {
             case "GIF": msg = "≈ \(humanSize(sample("GIF") * factor)) GIF"
+            case "WEBM": msg = "≈ \(humanSize(sample("WEBM") * factor)) WebM"
             case "Web":
                 let w = sample("WEBM") * factor, g = sample("GIF") * factor
                 msg = "≈ \(humanSize(w + g)) total  (webm \(humanSize(w)) + gif \(humanSize(g)))"
-            default: msg = "≈ \(humanSize(sample("MP4") * factor)) MP4"
+            default: msg = "≈ \(humanSize(sample(fmt) * factor)) \(fmt)"
             }
             DispatchQueue.main.async {
                 s.estimating = false
-                s.setStatus("\(msg) · \(quality) · \(mmss(durSel)) — rough estimate; low-motion reads high", "ok")
+                s.setStatus("\(msg)\(wasStr) · \(quality) · \(mmss(durSel)) — rough estimate; low-motion reads high", "ok")
             }
         }
     }

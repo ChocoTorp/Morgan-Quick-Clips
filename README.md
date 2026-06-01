@@ -72,7 +72,7 @@ falls back to Homebrew for dev builds. ggml backend plugins sit next to
 
 The app is now **self-contained**, but to host it for others you still need:
 
-1. **Apple Developer Program ($99/yr)** → a *Developer ID Application* certificate.
+1. **Apple Developer Program** → a *Developer ID Application* certificate.
 2. **Sign + notarize:**
    ```bash
    SIGN_ID="Developer ID Application: Your Name (TEAMID)" ./build.sh --bundle
@@ -80,8 +80,7 @@ The app is now **self-contained**, but to host it for others you still need:
    ```
    (`build.sh` applies the hardened runtime + `Resources/entitlements.plist`;
    `notarize.sh` submits to Apple and staples the ticket.)
-3. **Architecture** — built `arm64` only (bundled tools are arm64). For Intel Macs
-   you'd need a universal build with universal tools.
+3. **Architecture** — built `arm64` only (bundled tools are arm64).
 4. **macOS 15+** required (ScreenCaptureKit `SCRecordingOutput`).
 5. **Licensing** — the bundled ffmpeg (x264/x265) makes the distribution **GPL**;
    provide the corresponding source/offer when you publish.

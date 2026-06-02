@@ -69,6 +69,48 @@ func runTool(_ exe: String, _ args: [String], env: [String: String] = [:]) -> St
 // Split a plan() codec string ("-c:v libx264 -crf 18 …") into argv tokens.
 func args(_ s: String) -> [String] { s.split(separator: " ").map(String.init) }
 
+// Last "out_time=HH:MM:SS.us" value (in seconds) from streamed ffmpeg -progress text.
+func lastOutTime(_ s: String) -> Double? {
+    guard let r = s.range(of: "out_time=", options: .backwards) else { return nil }
+    let str = s[r.upperBound...].prefix { $0 != "\n" && $0 != "\r" }
+    let parts = str.split(separator: ":")
+    guard parts.count == 3, let hh = Double(parts[0]), let mm = Double(parts[1]),
+          let ss = Double(parts[2]) else { return nil }
+    return hh * 3600 + mm * 60 + ss
+}
+
+// Run ffmpeg while streaming `-progress pipe:1`, reporting 0…1 as it encodes.
+// Returns the merged output (for error reporting), like runTool. `onStart` hands back
+// the Process so the caller can terminate it (Cancel).
+func runFFmpegProgress(_ args: [String], total: Double, onStart: ((Process) -> Void)? = nil,
+                       onProgress: @escaping (Double) -> Void) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: gFFmpeg)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return "" }
+    onStart?(p)
+    let h = pipe.fileHandleForReading
+    var collected = ""
+    while case let chunk = h.availableData, !chunk.isEmpty {
+        collected += String(data: chunk, encoding: .utf8) ?? ""
+        if total > 0, let t = lastOutTime(collected) {
+            onProgress(min(1, max(0, t / total)))
+        }
+    }
+    p.waitUntilExit()
+    return collected.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+// "~12s left" / "~1m 05s left" for an ETA in seconds.
+func etaString(_ sec: Double) -> String {
+    guard sec > 0 else { return "" }
+    let s = Int(sec.rounded())
+    return s >= 60 ? "~\(s / 60)m \(String(format: "%02d", s % 60))s left" : "~\(s)s left"
+}
+
 func fittedRect(_ container: CGSize, _ sw: CGFloat, _ sh: CGFloat) -> CGRect {
     guard sw > 0, sh > 0, container.width > 0, container.height > 0 else { return .zero }
     let scale = min(container.width / sw, container.height / sh)
@@ -249,6 +291,10 @@ final class EditorState: ObservableObject {
     @Published var playing = false
     @Published var loading = false
     @Published var exporting = false
+    @Published var exportProgress: Double = 0   // 0…1 while exporting (determinate bar)
+    @Published var exportETA = ""               // "~12s left"
+    var exportProcess: Process?                 // the running ffmpeg, so Cancel can stop it
+    var exportCancelled = false
     @Published var estimating = false           // a "Harder estimate" sample encode is running
     @Published var hardBytes: Double? = nil      // measured estimate (sample-encoded) for current settings
     @Published var hardSig = ""                  // settings signature the measured estimate was taken at
@@ -717,6 +763,8 @@ struct ContentView: View {
     @State private var screenMenuOpen = false
     @State private var captionsOpen = false       // captions popover shown?
     @State private var playHover = false          // play button hover state
+    @State private var recordHover = false        // record button hover state
+    @State private var cancelHover = false        // cancel button hover state
     @State private var sliderColH: CGFloat = 0   // measured height of the 3-slider column
     @FocusState private var outFocus: Int?   // 1 = width field, 2 = height field
 
@@ -768,7 +816,16 @@ struct ContentView: View {
                         Spacer()
                         Button(action: { startRecording() }) {
                             Label("Record Screen", systemImage: "record.circle")
-                        }.tint(.red).buttonStyle(.borderedProminent)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(recordHover ? .white : .red)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(recordHover ? Color.red : Color.clear)
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.primary.opacity(0.15), lineWidth: 1))
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { h in withAnimation(.easeInOut(duration: 0.075)) { recordHover = h } }
                     }
                 }
                 .font(.system(size: 12))
@@ -853,7 +910,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.plain)
                         .overlay(Rectangle().stroke(Color.primary.opacity(0.12), lineWidth: 1))  // hard corners
-                        .onHover { h in withAnimation(.easeInOut(duration: 0.15)) { playHover = h } }
+                        .onHover { h in withAnimation(.easeInOut(duration: 0.075)) { playHover = h } }
                         .disabled(s.inputURL == nil)
                         Timeline().environmentObject(s)
                     }
@@ -1134,26 +1191,52 @@ struct ContentView: View {
         return "\(res) · \(len) · \(src) source — drag the handles to trim; lower the sliders to shrink the file."
     }
 
-    // Bottom feedback bar: spinner while working, colored result otherwise.
+    // Bottom feedback bar: a determinate progress bar while exporting, spinner while
+    // working, colored result otherwise.
     var statusBar: some View {
         // Show the live state summary when idle with a clip; transient messages otherwise.
         let showHint = s.inputURL != nil && s.statusKind == "info"
+        let determinate = s.exporting && s.exportProgress > 0
         return HStack(spacing: 8) {
-            switch s.statusKind {
-            case "work":
-                ProgressView().controlSize(.small).scaleEffect(0.8)
-            case "ok":
-                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-            case "err":
-                Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
-            default:
-                Image(systemName: "info.circle").foregroundColor(.secondary)
+            if determinate {
+                Image(systemName: "square.and.arrow.down.fill").foregroundColor(.accentColor)
+            } else {
+                switch s.statusKind {
+                case "work":
+                    ProgressView().controlSize(.small).scaleEffect(0.8)
+                case "ok":
+                    Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                case "err":
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
+                default:
+                    Image(systemName: "info.circle").foregroundColor(.secondary)
+                }
             }
-            Text(showHint ? idleHint : s.status)
+            Text(determinate ? s.status : (showHint ? idleHint : s.status))
                 .font(.system(size: 11))
                 .foregroundColor(s.statusKind == "ok" ? .green : (s.statusKind == "err" ? .red : .secondary))
                 .lineLimit(2)
+            if determinate {
+                ProgressView(value: s.exportProgress).frame(width: 150)
+                Text("\(Int(s.exportProgress * 100))%\(s.exportETA.isEmpty ? "" : "  \(s.exportETA)")")
+                    .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+            }
             Spacer()
+            if s.exporting {
+                Button(action: { cancelExport() }) {
+                    Text("Cancel")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(cancelHover ? .white : .red)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(cancelHover ? Color.red : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.primary.opacity(0.15), lineWidth: 1))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .onHover { h in withAnimation(.easeInOut(duration: 0.075)) { cancelHover = h } }
+                .disabled(s.exportCancelled)
+            }
         }
         .padding(.horizontal, 10).padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1495,6 +1578,12 @@ struct ContentView: View {
         }
     }
 
+    // Stop the in-progress export: flag it and terminate the running ffmpeg.
+    func cancelExport() {
+        s.exportCancelled = true
+        s.exportProcess?.terminate()
+    }
+
     func export() {
         guard let input = s.inputURL else { return }
         if s.outFormat == "Web" { exportWeb(input); return }
@@ -1516,6 +1605,7 @@ struct ContentView: View {
         let posLbl = isBatch ? " · clip \(s.queueIndex + 1)/\(s.queue.count)" : ""
 
         s.exporting = true
+        s.exportProgress = 0; s.exportETA = ""
         s.setStatus(wantCaps ? "Transcribing…" : "Exporting \(fmt) · \(qLabel(quality))\(posLbl)…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
             var burnSrt: String? = nil
@@ -1533,8 +1623,14 @@ struct ContentView: View {
                 DispatchQueue.main.async { s.setStatus("Exporting \(fmt) · \(qLabel(quality))\(posLbl)…", "work") }
             }
             let p = plan(fmt, quality, crop, fpsOv)
-            let err = runTool(gFFmpeg, ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),
-                                        "-vf",p.vf] + args(p.codec) + [out.path])
+            let startT = Date()
+            let err = runFFmpegProgress(["-y","-v","error","-progress","pipe:1","-i",input.path,"-ss",String(st),"-t",String(durSel),
+                                         "-vf",p.vf] + args(p.codec) + [out.path], total: durSel,
+                                        onStart: { proc in DispatchQueue.main.async { s.exportProcess = proc } }) { frac in
+                let elapsed = Date().timeIntervalSince(startT)
+                let eta = frac > 0.03 ? elapsed * (1 - frac) / frac : 0
+                DispatchQueue.main.async { s.exportProgress = frac; s.exportETA = etaString(eta) }
+            }
             // Embed a soft (toggleable) subtitle track for MP4 when requested.
             if burn, ext == "mp4", let srt = burnSrt, FileManager.default.fileExists(atPath: out.path) {
                 let tmp = out.path + ".subs.mp4"
@@ -1547,8 +1643,13 @@ struct ContentView: View {
                 }
             }
             DispatchQueue.main.async {
-                s.exporting = false
-                if FileManager.default.fileExists(atPath: out.path) {
+                let cancelled = s.exportCancelled
+                s.exporting = false; s.exportProgress = 0; s.exportETA = ""
+                s.exportProcess = nil; s.exportCancelled = false
+                if cancelled {
+                    try? FileManager.default.removeItem(atPath: out.path)
+                    s.setStatus("Export canceled.", "info")
+                } else if FileManager.default.fileExists(atPath: out.path) {
                     if isBatch { advanceAfterExport(out.lastPathComponent) }
                     else {
                         s.setStatus("Saved \(out.lastPathComponent)", "ok")
@@ -1618,18 +1719,38 @@ struct ContentView: View {
 
         let pw = plan("WEBM", s.quality, crop, fpsOverride())
         let pg = plan("GIF", s.quality, crop, fpsOverride())
-        let webmArgs = ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pw.vf] + args(pw.codec) + [webm.path]
-        let gifArgs = ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pg.vf, gif.path]
+        let webmArgs = ["-y","-v","error","-progress","pipe:1","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pw.vf] + args(pw.codec) + [webm.path]
+        let gifArgs = ["-y","-v","error","-progress","pipe:1","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pg.vf, gif.path]
 
         s.exporting = true
+        s.exportProgress = 0; s.exportETA = ""
         s.setStatus("Exporting Web · \(qLabel(s.quality)) → \(base)_forweb…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
             try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            let e1 = runTool(gFFmpeg, webmArgs)
-            DispatchQueue.main.async { s.setStatus("webm done, building gif…", "work") }
-            let e2 = runTool(gFFmpeg, gifArgs)
+            func report(_ frac: Double, _ startT: Date) {
+                let elapsed = Date().timeIntervalSince(startT)
+                let eta = frac > 0.03 ? elapsed * (1 - frac) / frac : 0
+                DispatchQueue.main.async { s.exportProgress = frac; s.exportETA = etaString(eta) }
+            }
+            let reg: (Process) -> Void = { proc in DispatchQueue.main.async { s.exportProcess = proc } }
+            let t1 = Date()
+            let e1 = runFFmpegProgress(webmArgs, total: durSel, onStart: reg) { report($0, t1) }
+            var e2 = ""
+            if !s.exportCancelled {
+                DispatchQueue.main.async { s.exportProgress = 0; s.exportETA = ""; s.setStatus("webm done, building gif…", "work") }
+                let t2 = Date()
+                e2 = runFFmpegProgress(gifArgs, total: durSel, onStart: reg) { report($0, t2) }
+            }
             DispatchQueue.main.async {
-                s.exporting = false
+                if s.exportCancelled {
+                    try? FileManager.default.removeItem(at: folder)
+                    s.exporting = false; s.exportProgress = 0; s.exportETA = ""
+                    s.exportProcess = nil; s.exportCancelled = false
+                    s.setStatus("Export canceled.", "info")
+                    return
+                }
+                s.exporting = false; s.exportProgress = 0; s.exportETA = ""
+                s.exportProcess = nil
                 let okW = FileManager.default.fileExists(atPath: webm.path)
                 let okG = FileManager.default.fileExists(atPath: gif.path)
                 if okW && okG {

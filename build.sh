@@ -20,7 +20,25 @@ EXE="SimpleClips"
 BUNDLE_ID="com.mblocal.clipeditor1"   # unchanged on purpose: keeps the existing TCC permission grant
 OUT_DIR="${APP_OUT:-$(pwd)/build}"
 APP="$OUT_DIR/$APP_NAME.app"
-SIGN_ID="${SIGN_ID:--}"                 # default ad-hoc
+# Signing identity. A STABLE signature is what keeps macOS TCC grants (e.g. Screen
+# Recording) across rebuilds — ad-hoc (`-`) re-randomizes the designated requirement
+# every build, so the grant is dropped. If SIGN_ID isn't set, sign with the first
+# local code-signing identity found in the keychain (create one once in Keychain
+# Access ▸ Certificate Assistant ▸ Create a Certificate: Self-Signed Root, type Code
+# Signing). Falls back to ad-hoc if none exists.
+if [ -z "${SIGN_ID:-}" ]; then
+  DEV_CERT="$(security find-identity -v -p codesigning 2>/dev/null \
+              | sed -n 's/.*\"\(.*\)\"$/\1/p' | head -1)"
+  if [ -n "$DEV_CERT" ]; then
+    SIGN_ID="$DEV_CERT"
+  else
+    SIGN_ID="-"
+    echo "==> NOTE: no local code-signing cert found — using ad-hoc."
+    echo "    Screen Recording permission will need re-granting after each rebuild."
+    echo "    To make it stick: Keychain Access ▸ Certificate Assistant ▸ Create a"
+    echo "    Certificate… Self-Signed Root, type Code Signing."
+  fi
+fi
 ENT="$(pwd)/Resources/entitlements.plist"
 
 echo "==> Building $APP_NAME.app  (bundle=$BUNDLE, sign=$SIGN_ID)"

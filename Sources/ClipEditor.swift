@@ -92,50 +92,52 @@ func fileBytes(_ path: String) -> Double {
 
 // Single source of truth for encode settings, shared by export AND the estimator
 // so the estimate reflects exactly what export will do.
-// format: "MP4" | "GIF" | "WEBM".  quality: "Fidelity" | "Balanced" | "Optimized".
+// format: "MP4" | "GIF" | "WEBM".  q: continuous fidelity→optimization, 0...1
+//   (0 = maximum fidelity, 1 = maximum optimization; the slider drives this).
 // Returns the -vf filtergraph and the trailing codec args.
-func plan(_ format: String, _ quality: String, _ crop: String, _ fps: Int?) -> (vf: String, codec: String) {
+func plan(_ format: String, _ q: Double, _ crop: String, _ fps: Int?) -> (vf: String, codec: String) {
     let rate = (fps != nil) ? " -r \(fps!)" : ""
+    let qq = min(max(q, 0), 1)
     switch format {
-    // NOTE: quality presets only change compression — they NEVER alter resolution.
+    // NOTE: the quality slider only changes compression — it NEVER alters resolution.
     // Output size is controlled entirely by the user's crop + output-size fields
     // (already baked into `crop`).
     case "GIF":
-        let gfps: Int, pal: String, use: String
-        switch quality {
-        case "Fidelity":  gfps = 20; pal = "palettegen=stats_mode=full"; use = "paletteuse=dither=sierra2_4a"
-        case "Optimized": gfps = 12; pal = "palettegen=max_colors=128:stats_mode=diff"; use = "paletteuse=dither=bayer:bayer_scale=2"
-        default:          gfps = 15; pal = "palettegen=stats_mode=diff"; use = "paletteuse=dither=bayer"
-        }
+        let gfps = Int((20 - qq * 8).rounded())          // 20 → 12 fps
+        let pal: String, use: String
+        if qq < 0.34 {        pal = "palettegen=stats_mode=full";                use = "paletteuse=dither=sierra2_4a" }
+        else if qq < 0.67 {   pal = "palettegen=stats_mode=diff";                use = "paletteuse=dither=bayer" }
+        else {                pal = "palettegen=max_colors=128:stats_mode=diff"; use = "paletteuse=dither=bayer:bayer_scale=2" }
         let vf = "\(crop),fps=\(fps ?? gfps),split[a][b];[a]\(pal)[p];[b][p]\(use)"
         return (vf, "")
     case "WEBM":
-        var crf = 32; var ab = 128; var extra = "-row-mt 1"
-        switch quality {
-        case "Fidelity":  crf = 18; ab = 192     // detail first; size not a concern
-        case "Optimized": crf = 40; ab = 96; extra = "-row-mt 1 -deadline good -cpu-used 3"
-        default: break
-        }
+        let crf = Int((18 + qq * 22).rounded())          // 18 → 40
+        let ab  = Int((192 - qq * 96).rounded())         // 192 → 96 kbps
+        let extra = qq > 0.67 ? "-row-mt 1 -deadline good -cpu-used 3" : "-row-mt 1"
         return (crop, "-c:v libvpx-vp9 -crf \(crf) -b:v 0 \(extra) -pix_fmt yuv420p\(rate) -c:a libopus -b:a \(ab)k")
     case "MPG":   // MPEG-1/2 program stream
-        var q = 5
-        switch quality { case "Fidelity": q = 2; case "Optimized": q = 7; default: break }
-        return (crop, "-c:v mpeg2video -q:v \(q)\(rate) -c:a mp2 -b:a 192k")
+        let qv = Int((2 + qq * 5).rounded())             // 2 → 7
+        return (crop, "-c:v mpeg2video -q:v \(qv)\(rate) -c:a mp2 -b:a 192k")
     case "WMV":
-        var q = 4
-        switch quality { case "Fidelity": q = 2; case "Optimized": q = 6; default: break }
-        return (crop, "-c:v wmv2 -q:v \(q)\(rate) -c:a wmav2 -b:a 192k")
+        let qv = Int((2 + qq * 4).rounded())             // 2 → 6
+        return (crop, "-c:v wmv2 -q:v \(qv)\(rate) -c:a wmav2 -b:a 192k")
     default:      // H.264/AAC family of containers: MP4, MOV, M4V, MKV, AVI, TS, FLV, F4V, 3GP
-        var crf = 22; var preset = "medium"; var ab = 128
-        switch quality {
-        case "Fidelity":  crf = 14; preset = "slow"; ab = 256   // detail first; size not a concern
-        case "Optimized": crf = 30; preset = "slower"; ab = 96
-        default: break
-        }
+        let crf = Int((14 + qq * 16).rounded())          // 14 → 30
+        let preset = qq < 0.34 ? "slow" : (qq < 0.67 ? "medium" : "slower")
+        let ab  = Int((256 - qq * 160).rounded())        // 256 → 96 kbps
         let profile = (format == "3GP") ? " -profile:v baseline -level 3.1" : ""
         let fast = ["MP4","MOV","M4V"].contains(format) ? " -movflags +faststart" : ""
         return (crop, "-c:v libx264 -crf \(crf) -preset \(preset)\(profile) -pix_fmt yuv420p\(rate) -c:a aac -b:a \(ab)k\(fast)")
     }
+}
+
+// A short human label for a fidelity→optimization slider value (0...1).
+func qLabel(_ q: Double) -> String {
+    if q < 0.2 { return "high fidelity" }
+    if q < 0.45 { return "fidelity-leaning" }
+    if q <= 0.55 { return "balanced" }
+    if q < 0.8 { return "optimized-leaning" }
+    return "high optimization"
 }
 
 // Output file extension for a format tag.
@@ -243,25 +245,28 @@ final class EditorState: ObservableObject {
     @Published var cropY: CGFloat = 0
     @Published var cropW: CGFloat = 0
     @Published var cropH: CGFloat = 0
+    @Published var cropOn = false          // crop enabled? off = export the full frame
     @Published var playing = false
     @Published var loading = false
     @Published var exporting = false
-    @Published var estimating = false
-    @Published var status = "Drop a .mp4 or .gif to begin."
+    @Published var estimating = false           // a "Harder estimate" sample encode is running
+    @Published var hardBytes: Double? = nil      // measured estimate (sample-encoded) for current settings
+    @Published var hardSig = ""                  // settings signature the measured estimate was taken at
+    @Published var status = "Drop video, .gif, or multiple files here."
     @Published var statusKind = "info"   // info | work | ok | err
     @Published var outFormat = "MP4"   // set to the detected input type on load
-    @Published var quality = "Balanced"   // Fidelity | Balanced | Optimized
+    @Published var quality: Double = 0.5  // 0 = max fidelity … 1 = max optimization (slider)
     @Published var outName = ""
     // Output pixel size (aspect-locked to the crop). Defaults to the crop size.
     @Published var outW: Int = 0
     @Published var outH: Int = 0
     @Published var srcFps: Double = 0      // source frame rate
-    @Published var fpsOn = false           // override fps?
-    @Published var fpsText = ""            // target fps when overriding
+    @Published var fps: Double = 30        // target fps (slider); == srcFps means "keep source"
     // captions / transcription (whisper.cpp)
     @Published var capBurn = false         // burn subtitles into the video
     @Published var capSrt = false          // save sidecar .srt
     @Published var capTxt = false          // save plain transcript .txt
+    @Published var hasCaptions = false     // current clip has an embedded subtitle track
     @Published var queue: [URL] = []       // batch queue
     @Published var queueIndex = 0
     @Published var exportFolder: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop")
@@ -320,6 +325,21 @@ final class EditorState: ObservableObject {
             player.play(); playing = true
         }
     }
+
+    // Never show embedded subtitles in the preview: disable automatic selection and
+    // deselect the legible track so a "default"-flagged track doesn't show itself.
+    func applyCaptions() {
+        player.appliesMediaSelectionCriteriaAutomatically = false
+        guard let item = player.currentItem else { return }
+        let asset = item.asset
+        Task {
+            let group = try? await asset.loadMediaSelectionGroup(for: .legible)
+            await MainActor.run {
+                guard let group = group, item == self.player.currentItem else { return }
+                item.select(nil, in: group)
+            }
+        }
+    }
 }
 
 // ---- AVPlayer NSView -----------------------------------------------------
@@ -349,13 +369,37 @@ final class KeyableWindow: NSWindow { override var canBecomeKey: Bool { true } }
 // Transparent, borderless window: drag the body to move (across displays),
 // drag the bottom-right handle to resize. Shows W×H. Excluded from capture.
 final class RegionView: NSView {
-    private enum Mode { case move, bl, br, tl, tr }   // corner being resized, or move
+    private enum Mode { case none, move, bl, br, tl, tr }   // none = empty area (ignored)
     private let grab: CGFloat = 22                     // corner hit/draw size
     private var mode: Mode = .move
     private var startMouse = NSPoint.zero
     private var startFrame = NSRect.zero
+    // While recording: fade to a thin white outline only — no handles/label, not movable.
+    var recording = false {
+        didSet {
+            let t = CATransition(); t.type = .fade; t.duration = 0.25
+            layer?.add(t, forKey: "fade")
+            needsDisplay = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) { super.init(frame: frameRect); wantsLayer = true }
+    required init?(coder: NSCoder) { super.init(coder: coder); wantsLayer = true }
+
+    // The centered W×H label's background box — also the only area you can grab to MOVE.
+    private func labelBox() -> NSRect {
+        let txt = "\(Int(frame.width)) × \(Int(frame.height))" as NSString
+        let sz = txt.size(withAttributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold)])
+        return NSRect(x: (bounds.width - sz.width) / 2 - 12, y: (bounds.height - sz.height) / 2 - 9,
+                      width: sz.width + 24, height: sz.height + 18)
+    }
 
     override func draw(_ dirty: NSRect) {
+        if recording {
+            let outline = NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5)); outline.lineWidth = 1
+            NSColor.white.setStroke(); outline.stroke()
+            return
+        }
         let border = NSBezierPath(rect: bounds.insetBy(dx: 1, dy: 1)); border.lineWidth = 2
         NSColor.controlAccentColor.setStroke(); border.stroke()
         // grabbers in all four corners
@@ -371,14 +415,25 @@ final class RegionView: NSView {
         let attrs: [NSAttributedString.Key: Any] = [.foregroundColor: NSColor.white,
                                                      .font: NSFont.systemFont(ofSize: 12, weight: .semibold)]
         let sz = txt.size(withAttributes: attrs)
-        let bg = NSRect(x: (bounds.width - sz.width)/2 - 6, y: (bounds.height - sz.height)/2 - 3,
-                        width: sz.width + 12, height: sz.height + 6)
+        let bg = labelBox()
         NSColor.black.withAlphaComponent(0.55).setFill()
         NSBezierPath(roundedRect: bg, xRadius: 4, yRadius: 4).fill()
         txt.draw(at: NSPoint(x: (bounds.width - sz.width)/2, y: (bounds.height - sz.height)/2), withAttributes: attrs)
     }
 
+    // Only the corners and the center label box are interactive; the empty middle
+    // returns nil so clicks pass straight through to whatever app is behind.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if recording { return nil }                 // fully click-through while recording
+        let p = convert(point, from: superview)
+        let left = p.x < grab, right = p.x > bounds.maxX - grab
+        let bottom = p.y < grab, top = p.y > bounds.maxY - grab
+        let onCorner = (left || right) && (top || bottom)
+        return (onCorner || labelBox().contains(p)) ? self : nil
+    }
+
     override func mouseDown(with e: NSEvent) {
+        if recording { return }
         startMouse = NSEvent.mouseLocation
         startFrame = window?.frame ?? .zero
         let p = convert(e.locationInWindow, from: nil)
@@ -388,10 +443,12 @@ final class RegionView: NSView {
         else if right && bottom { mode = .br }
         else if left && top     { mode = .tl }
         else if right && top    { mode = .tr }
-        else                    { mode = .move }
+        else if labelBox().contains(p) { mode = .move }   // only the center label moves it
+        else                    { mode = .none }          // empty area → no drag
     }
 
     override func mouseDragged(with e: NSEvent) {
+        if recording || mode == .none { return }
         guard let win = window else { return }
         let m = NSEvent.mouseLocation
         let dx = m.x - startMouse.x, dy = m.y - startMouse.y
@@ -405,7 +462,7 @@ final class RegionView: NSView {
         case .bl: w = startFrame.width - dx; h = startFrame.height - dy; x = startFrame.minX + dx; y = startFrame.minY + dy
         case .tr: w = startFrame.width + dx; h = startFrame.height + dy
         case .tl: w = startFrame.width - dx; h = startFrame.height + dy; x = startFrame.minX + dx
-        case .move: break
+        case .move, .none: break
         }
         // Clamp to minimums while keeping the opposite (anchored) corner fixed.
         if w < minW { if mode == .bl || mode == .tl { x = startFrame.maxX - minW }; w = minW }
@@ -435,6 +492,13 @@ final class RegionSelector {
     }
     func show() { window.orderFrontRegardless() }   // appear over fullscreen without activating
     func hide() { window.orderOut(nil) }
+    // Recording: thin white outline, non-interactive. Click-through is handled entirely
+    // by RegionView.hitTest (nil everywhere while recording; nil on empty areas otherwise).
+    // We deliberately do NOT toggle window.ignoresMouseEvents — flipping it true→false
+    // leaves hitTest passthrough broken, which is why click-through died after recording.
+    func setRecording(_ on: Bool) {
+        (window.contentView as? RegionView)?.recording = on
+    }
 
     // Map the window to (displayID, sourceRect in display-local TOP-LEFT points, output pixels).
     func captureInfo() -> (displayID: CGDirectDisplayID, rect: CGRect, pxW: Int, pxH: Int)? {
@@ -503,7 +567,7 @@ struct CropOverlay: View {
                 p.addRect(r)
             }.fill(Color.black.opacity(0.45), style: FillStyle(eoFill: true))
 
-            Rectangle().path(in: r).stroke(Color.yellow, lineWidth: 2)
+            Rectangle().path(in: r).stroke(Color.accentColor, lineWidth: 2)
 
             // move handle (whole body)
             Color.clear.frame(width: r.width, height: r.height)
@@ -534,7 +598,8 @@ struct CropOverlay: View {
         case .bottomLeading: pt = CGPoint(x: r.minX, y: r.maxY)
         case .bottomTrailing: pt = CGPoint(x: r.maxX, y: r.maxY)
         }
-        return Circle().fill(Color.yellow).frame(width: 14, height: 14)
+        return Circle().fill(Color.accentColor).frame(width: 14, height: 14)
+            .overlay(Circle().stroke(Color.white.opacity(0.6), lineWidth: 1))
             .offset(x: pt.x - 7, y: pt.y - 7)
             .gesture(DragGesture().onChanged { g in
                 if snap == nil { snap = CGRect(x: s.cropX, y: s.cropY, width: s.cropW, height: s.cropH) }
@@ -570,18 +635,20 @@ struct Timeline: View {
             let inset = hitW / 2
             let W = max(1, geo.size.width - inset * 2)        // inner (track) width
             let dur = max(s.duration, 0.001)
-            let xStart = inset + CGFloat(s.trimStart / dur) * W
-            let xEnd = inset + CGFloat(s.trimEnd / dur) * W
-            let xCur = inset + CGFloat(s.current / dur) * W
+            // Before a clip loads, show the bar full width with a handle at each end.
+            let hasClip = s.duration > 0
+            let xStart = inset + CGFloat(hasClip ? s.trimStart / dur : 0) * W
+            let xEnd = inset + CGFloat(hasClip ? s.trimEnd / dur : 1) * W
+            let xCur = inset + CGFloat(hasClip ? s.current / dur : 0) * W
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 4).fill(Color.gray.opacity(0.25))
                     .padding(.horizontal, inset)
                 // selected region
-                Rectangle().fill(Color.accentColor.opacity(0.30))
+                Rectangle().fill(Color.accentColor.opacity(0.28))
                     .frame(width: max(0, xEnd - xStart)).offset(x: xStart)
                 // playhead
-                Rectangle().fill(Color.white).frame(width: 2).offset(x: xCur - 1)
-                // trim handles — wide grab area, yellow, with direction arrows.
+                Rectangle().fill(Color.primary.opacity(0.8)).frame(width: 2).offset(x: xCur - 1)
+                // trim handles — wide grab area, accent-colored, with direction arrows.
                 handle(.right)                                  // start: ▶ points into the clip
                     .offset(x: xStart - hitW / 2)
                     .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
@@ -595,7 +662,7 @@ struct Timeline: View {
                         s.trimEnd = t; s.seek(t)
                     })
             }
-            .frame(height: 40)
+            .frame(height: barH)
             .coordinateSpace(name: "tl")
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
@@ -606,57 +673,81 @@ struct Timeline: View {
                 }
             })
         }
-        .frame(height: 40)
+        .frame(height: barH)
     }
 
     enum Dir { case left, right }
-    private var hitW: CGFloat { 30 }   // generous grab width (no dead spot)
+    private var hitW: CGFloat { 28 }   // generous grab width (no dead spot)
+    private var barH: CGFloat { 32 }   // timeline / handle height
 
     func handle(_ dir: Dir) -> some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 3).fill(Color.yellow)
-                .frame(width: 16, height: 40)
-                .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.black.opacity(0.55), lineWidth: 1))
-            Image(systemName: dir == .right ? "arrowtriangle.right.fill" : "arrowtriangle.left.fill")
-                .font(.system(size: 10, weight: .black)).foregroundColor(.black)
+            RoundedRectangle(cornerRadius: 4).fill(Color.accentColor)
+                .frame(width: 13, height: barH)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.white.opacity(0.45), lineWidth: 1))
+            // grip indicator (rounded rect) instead of a direction triangle
+            RoundedRectangle(cornerRadius: 1.5).fill(Color.white.opacity(0.9))
+                .frame(width: 3, height: barH * 0.42)
         }
-        .frame(width: hitW, height: 40)        // wide, fully-hittable grab zone
+        .frame(width: hitW, height: barH)      // wide, fully-hittable grab zone
         .contentShape(Rectangle())
     }
 }
 
 // ---- main view -----------------------------------------------------------
 
+// Subtle rounded "card" used to group a section (toolbar, sliders, output row).
+struct SectionCard: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .overlay(RoundedRectangle(cornerRadius: 4)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1))
+            )
+    }
+}
+extension View { func sectionCard() -> some View { modifier(SectionCard()) } }
+
 struct ContentView: View {
     @EnvironmentObject var s: EditorState
     @State private var dropTargeted = false
     @State private var screenMenuOpen = false
+    @State private var captionsOpen = false       // captions popover shown?
+    @State private var playHover = false          // play button hover state
+    @State private var sliderColH: CGFloat = 0   // measured height of the 3-slider column
     @FocusState private var outFocus: Int?   // 1 = width field, 2 = height field
 
     var body: some View {
         VStack(spacing: 10) {
-            // recording controls
+            // recording controls — toolbar-style bar
             if #available(macOS 15, *) {
                 HStack(spacing: 10) {
                     if s.recording {
+                        Text("● REC").font(.system(size: 11, weight: .bold)).foregroundColor(.red)
+                        Spacer()
                         Button(action: { stopRecording() }) {
                             Label("Stop  \(mmss(s.recElapsed))", systemImage: "stop.fill")
                         }.tint(.red).buttonStyle(.borderedProminent)
-                        Text("● REC").font(.system(size: 11, weight: .bold)).foregroundColor(.red)
                     } else {
-                        Button(action: { startRecording() }) {
-                            Label("Record Screen", systemImage: "record.circle")
-                        }.tint(.red)
-                        Toggle("Region", isOn: $s.regionOn)
-                            .toggleStyle(.button)
-                            .onChange(of: s.regionOn) { on in toggleRegion(on) }
-                        if !s.regionOn && !s.screens.isEmpty {
+                        // Fullscreen ↔ Region mode (Region left, Fullscreen right; default fullscreen).
+                        Picker("", selection: $s.regionOn) {
+                            Text("Region").tag(true)
+                            Text("Fullscreen").tag(false)
+                        }
+                        .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                        .onChange(of: s.regionOn) { on in toggleRegion(on) }
+                        // Screen picker — enabled for fullscreen, grayed out for region.
+                        if !s.screens.isEmpty {
                             Button(action: { screenMenuOpen.toggle() }) {
                                 HStack(spacing: 4) {
                                     Text("Screen \(currentScreenIndex)")
                                     Image(systemName: "chevron.down").font(.system(size: 9))
                                 }
                             }
+                            .disabled(s.regionOn)
                             .popover(isPresented: $screenMenuOpen, arrowEdge: .bottom) {
                                 VStack(alignment: .leading, spacing: 2) {
                                     ForEach(Array(s.screens.enumerated()), id: \.element.id) { i, scr in
@@ -670,163 +761,210 @@ struct ContentView: View {
                                 if open { showScreenNumbers() } else { hideScreenNumbers() }
                             }
                         }
+                        Divider().frame(height: 16)
                         Toggle("Mic", isOn: $s.micOn).toggleStyle(.checkbox)
                         Toggle("Screen audio", isOn: $s.sysAudioOn).toggleStyle(.checkbox)
                         Toggle("Cursor", isOn: $s.cursorOn).toggleStyle(.checkbox)
+                        Spacer()
+                        Button(action: { startRecording() }) {
+                            Label("Record Screen", systemImage: "record.circle")
+                        }.tint(.red).buttonStyle(.borderedProminent)
                     }
-                    Spacer()
                 }
+                .font(.system(size: 12))
+                .sectionCard()
             }
 
-            // preview + crop
-            GeometryReader { geo in
-                ZStack {
-                    Color.black
-                    PlayerView(player: s.player)
-                    if s.srcW > 0 { CropOverlay(container: geo.size).environmentObject(s) }
-                    if s.inputURL == nil {
-                        VStack(spacing: 8) {
-                            Image(systemName: "film").font(.system(size: 40)).foregroundColor(.white.opacity(0.4))
-                            Text("Drop a .mp4 or .gif here").foregroundColor(.white.opacity(0.5))
+            // Preview + clip bar + timeline as one attached unit (single border).
+            VStack(spacing: 0) {
+                // preview + crop
+                GeometryReader { geo in
+                    ZStack {
+                        Color.black
+                        PlayerView(player: s.player)
+                        if s.srcW > 0 && s.cropOn { CropOverlay(container: geo.size).environmentObject(s) }
+                        if s.inputURL == nil {
+                            VStack(spacing: 8) {
+                                Image(systemName: "film").font(.system(size: 40)).foregroundColor(.white.opacity(0.4))
+                                Text("Drop video, .gif, or multiple files here").foregroundColor(.white.opacity(0.5))
+                            }
+                        }
+                        if s.loading {
+                            Text("Loading preview…").padding(8).background(.black.opacity(0.6))
+                                .foregroundColor(.white).cornerRadius(4)
                         }
                     }
-                    if s.loading {
-                        Text("Loading preview…").padding(8).background(.black.opacity(0.6))
-                            .foregroundColor(.white).cornerRadius(6)
+                    .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
+                        loadDropped(providers); return true
                     }
                 }
-                .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
-                    loadDropped(providers); return true
+                // The preview is the ONLY flexible row — it absorbs all vertical resizing,
+                // so the fixed top/bottom controls are never clipped.
+                .frame(minHeight: 180)
+                .layoutPriority(-1)
+                .zIndex(1)   // crop dots overflow the bottom edge → keep them above the clip bar
+
+                Divider()   // single separator between the preview and the controls block
+
+                // clip bar — name, captions note, crop toggle, queue nav, remove
+                if !s.queue.isEmpty {
+                    HStack(spacing: 10) {
+                        Image(systemName: "square.stack.3d.up.fill").foregroundColor(.accentColor)
+                        Text("Clip \(s.queueIndex + 1) of \(s.queue.count): \(s.inputURL?.lastPathComponent ?? "")")
+                            .font(.system(size: 11, weight: .medium)).lineLimit(1)
+                        if s.hasCaptions {
+                            Text("(has captions)").font(.system(size: 11)).foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        if s.srcW > 0 {
+                            Toggle("Crop", isOn: $s.cropOn).toggleStyle(.button).font(.system(size: 11))
+                                .disabled(s.exporting)
+                                .onChange(of: s.cropOn) { on in if !on { s.resetCropFull() } }
+                                .help("Show the crop box. Off exports the full frame.")
+                            if s.cropOn {
+                                Text("\(evenInt(s.cropW))×\(evenInt(s.cropH))")
+                                    .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                                Button("Reset crop") { s.resetCropFull() }.font(.system(size: 11))
+                                    .help("Reset the crop to the full frame.")
+                            }
+                        }
+                        if s.queue.count > 1 {
+                            Button("◀︎ Prev") { navQueue(-1) }.disabled(s.queueIndex == 0 || s.exporting)
+                            Button("Next ▶︎") { navQueue(1) }.disabled(s.queueIndex >= s.queue.count - 1 || s.exporting)
+                        }
+                        Button("Remove") { removeCurrent() }.disabled(s.exporting)
+                    }
+                    .font(.system(size: 11))
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color(nsColor: .controlBackgroundColor))
                 }
-                .border(dropTargeted ? Color.accentColor : Color.clear, width: 3)
-            }
-            .frame(minHeight: 280)
 
-            if s.queue.count > 1 {
-                HStack(spacing: 10) {
-                    Image(systemName: "square.stack.3d.up.fill").foregroundColor(.accentColor)
-                    Text("Clip \(s.queueIndex + 1) of \(s.queue.count): \(s.inputURL?.lastPathComponent ?? "")")
-                        .font(.system(size: 11, weight: .medium)).lineLimit(1)
-                    Spacer()
-                    Button("◀︎ Prev") { navQueue(-1) }.disabled(s.queueIndex == 0 || s.exporting)
-                    Button("Next ▶︎") { navQueue(1) }.disabled(s.queueIndex >= s.queue.count - 1 || s.exporting)
-                    Button("Remove") { removeCurrent() }.disabled(s.exporting)
+                // play + trim bar, with the time / trim readout right beneath it
+                VStack(spacing: 6) {
+                    HStack(spacing: 10) {
+                        Button(action: { s.togglePlay() }) {
+                            Image(systemName: s.playing ? "pause.fill" : "play.fill")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundColor(playHover ? .white : .accentColor)
+                                .frame(width: 32, height: 32)          // square, same height as the trim bar
+                                // fades to a blue fill + white glyph on hover
+                                .background(playHover ? Color(red: 0.20, green: 0.45, blue: 0.85) : Color.clear)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .overlay(Rectangle().stroke(Color.primary.opacity(0.12), lineWidth: 1))  // hard corners
+                        .onHover { h in withAnimation(.easeInOut(duration: 0.15)) { playHover = h } }
+                        .disabled(s.inputURL == nil)
+                        Timeline().environmentObject(s)
+                    }
+                    HStack {
+                        Text("Time  \(mmss(s.current)) / \(mmss(s.duration))")
+                            .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                        Spacer()
+                        Text("Trim  \(mmss(s.trimStart)) → \(mmss(s.trimEnd))  (\(mmss(s.trimEnd - s.trimStart)))")
+                            .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
+                    }
                 }
-                .font(.system(size: 11))
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.12)))
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(Color(nsColor: .controlBackgroundColor))
+                // keep output size following the crop while you adjust the crop box
+                .onChange(of: s.cropW) { _ in s.syncOutToCrop() }
+                .onChange(of: s.cropH) { _ in s.syncOutToCrop() }
             }
+            .overlay(Rectangle().stroke(
+                dropTargeted ? Color.accentColor : Color.primary.opacity(0.12),
+                lineWidth: dropTargeted ? 2 : 1))
+            // thick glassy bezel around the whole preview/clip/trim unit
+            .padding(6)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .stroke(Color.white.opacity(0.18), lineWidth: 1))
+            .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
 
-            // transport
-            HStack(spacing: 12) {
-                Button(action: { s.togglePlay() }) {
-                    Image(systemName: s.playing ? "pause.fill" : "play.fill")
-                }.disabled(s.inputURL == nil)
-                Text("\(mmss(s.current)) / \(mmss(s.duration))").font(.system(size: 11, design: .monospaced))
-                Spacer()
-                if s.srcW > 0 {
-                    let cw = evenInt(s.cropW), ch = evenInt(s.cropH)
-                    let aspect = ch > 0 ? Double(cw) / Double(ch) : 1
-                    Text("Crop \(cw)×\(ch)  →")
-                        .font(.system(size: 11, design: .monospaced)).foregroundColor(.secondary)
-                    // Output pixels — editing one field auto-adjusts the other (aspect locked).
-                    // Capped at the crop size: you can downscale, never upscale past it.
-                    TextField("", value: Binding(
-                        get: { s.outW },
-                        set: { v in let w = min(cw, max(2, v - v % 2)); s.outW = w
-                                    let h = Int((Double(w) / aspect).rounded()); s.outH = min(ch, max(2, h - h % 2)) }),
-                        format: .number).textFieldStyle(.roundedBorder).frame(width: 56)
-                        .disabled(s.exporting).focused($outFocus, equals: 1)
-                    Text("×").font(.system(size: 11)).foregroundColor(.secondary)
-                    TextField("", value: Binding(
-                        get: { s.outH },
-                        set: { v in let h = min(ch, max(2, v - v % 2)); s.outH = h
-                                    let w = Int((Double(h) * aspect).rounded()); s.outW = min(cw, max(2, w - w % 2)) }),
-                        format: .number).textFieldStyle(.roundedBorder).frame(width: 56)
-                        .disabled(s.exporting).focused($outFocus, equals: 2)
-                    Text("px").font(.system(size: 11)).foregroundColor(.secondary)
-                    Button("Reset crop") { s.resetCropFull() }.font(.system(size: 11))
+            // Sliders (left) + estimate card spanning all three (right ~25%).
+            // The resolution slider scales the crop down; never up past it.
+            if s.srcW > 0 {
+                let cw = evenInt(s.cropW), ch = evenInt(s.cropH)
+                let aspect = ch > 0 ? Double(cw) / Double(ch) : 1
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(spacing: 8) {
+                        HStack(spacing: 8) {
+                            Text("Resolution").font(.system(size: 11)).foregroundColor(.secondary)
+                                .frame(width: 70, alignment: .leading)
+                            Slider(value: Binding(
+                                get: { cw > 0 ? min(100, Double(s.outW) / Double(cw) * 100) : 100 },
+                                set: { pct in
+                                    let f = max(0.1, min(1.0, pct / 100))
+                                    s.outW = evenInt(CGFloat(Double(cw) * f))
+                                    s.outH = evenInt(CGFloat(Double(ch) * f))
+                                }), in: 10...100, step: 1).disabled(s.exporting)
+                            Text("\(cw > 0 ? Int((Double(s.outW) / Double(cw) * 100).rounded()) : 100)%")
+                                .font(.system(size: 11, design: .monospaced)).frame(width: 40, alignment: .trailing)
+                            // Output pixels — editing one field auto-adjusts the other (aspect
+                            // locked), capped at the crop size: downscale only, never upscale.
+                            TextField("", value: Binding(
+                                get: { s.outW },
+                                set: { v in let w = min(cw, max(2, v - v % 2)); s.outW = w
+                                            let h = Int((Double(w) / aspect).rounded()); s.outH = min(ch, max(2, h - h % 2)) }),
+                                format: .number).textFieldStyle(.roundedBorder).frame(width: 52)
+                                .disabled(s.exporting).focused($outFocus, equals: 1)
+                            Text("×").font(.system(size: 11)).foregroundColor(.secondary)
+                            TextField("", value: Binding(
+                                get: { s.outH },
+                                set: { v in let h = min(ch, max(2, v - v % 2)); s.outH = h
+                                            let w = Int((Double(h) * aspect).rounded()); s.outW = min(cw, max(2, w - w % 2)) }),
+                                format: .number).textFieldStyle(.roundedBorder).frame(width: 52)
+                                .disabled(s.exporting).focused($outFocus, equals: 2)
+                            Text("px").font(.system(size: 11)).foregroundColor(.secondary)
+                        }
+                        HStack(spacing: 8) {
+                            Text("Optimized").font(.system(size: 11)).foregroundColor(.secondary)
+                                .frame(width: 70, alignment: .leading)
+                            // Inverted so the knob reads left=optimized, right=fidelity,
+                            // while s.quality stays 0=fidelity … 1=optimization underneath.
+                            Slider(value: Binding(get: { 1 - s.quality },
+                                                  set: { s.quality = 1 - $0 }), in: 0...1)
+                                .disabled(s.exporting)
+                            Text("Fidelity").font(.system(size: 11)).foregroundColor(.secondary)
+                                .frame(width: 64, alignment: .trailing)
+                        }
+                        HStack(spacing: 8) {
+                            Text("FPS").font(.system(size: 11)).foregroundColor(.secondary)
+                                .frame(width: 70, alignment: .leading)
+                            // Max = the source fps (you can only reduce fps, never add frames).
+                            Slider(value: $s.fps, in: 1...max(2, s.srcFps), step: 1)
+                                .disabled(s.inputURL == nil || s.exporting)
+                            Text("\(Int(s.fps.rounded())) fps").font(.system(size: 11, design: .monospaced))
+                                .frame(width: 64, alignment: .trailing)
+                        }
+                    }
+                    .background(GeometryReader { g in
+                        Color.clear
+                            .onAppear { sliderColH = g.size.height }
+                            .onChange(of: g.size.height) { h in sliderColH = h }
+                    })
+                    // Estimate card: locked to the height of the three sliders.
+                    liveReadout.frame(width: 200, height: sliderColH > 0 ? sliderColH : nil)
                 }
+                .sectionCard()
             }
-            // keep output size following the crop while you adjust the crop box
-            .onChange(of: s.cropW) { _ in s.syncOutToCrop() }
-            .onChange(of: s.cropH) { _ in s.syncOutToCrop() }
 
-            Timeline().environmentObject(s)
-
-            HStack {
-                Text("Trim  \(mmss(s.trimStart)) → \(mmss(s.trimEnd))  (\(mmss(s.trimEnd - s.trimStart)))")
-                    .font(.system(size: 11, design: .monospaced))
-                Spacer()
-                Picker("", selection: $s.quality) {
-                    Text("High fidelity").tag("Fidelity")
-                    Text("Balanced").tag("Balanced")
-                    Text("High optimization").tag("Optimized")
-                }.pickerStyle(.segmented).frame(width: 320).labelsHidden().disabled(s.exporting)
-            }
-            Text(qualityHint).font(.system(size: 10)).foregroundColor(.secondary)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-
+            // "Output" (left) + name / captions / format / location / export (right).
             HStack(spacing: 8) {
-                Text("Captions").font(.system(size: 11)).foregroundColor(.secondary)
-                Toggle("Embed subs", isOn: $s.capBurn).toggleStyle(.checkbox).disabled(s.exporting)
-                    .help("Embed a toggleable subtitle track in the MP4 (mov_text). MP4 only.")
-                Toggle(".srt", isOn: $s.capSrt).toggleStyle(.checkbox).disabled(s.exporting)
-                    .help("Save a separate .srt subtitle file next to the export.")
-                Toggle("Transcript", isOn: $s.capTxt).toggleStyle(.checkbox).disabled(s.exporting)
-                    .help("Save the spoken text as a .txt file.")
-                if (s.capBurn || s.capSrt || s.capTxt) && !whisperAvailable {
-                    Text("⚠︎ whisper not found").font(.system(size: 10)).foregroundColor(.orange)
-                } else if s.capBurn || s.capSrt || s.capTxt {
-                    Text("(adds a transcription pass)").font(.system(size: 10)).foregroundColor(.secondary)
-                }
+                Text("Output").font(.system(size: 11, weight: .semibold)).foregroundColor(.secondary)
                 Spacer()
-            }
-
-            HStack(spacing: 8) {
                 Text("Name").font(.system(size: 11)).foregroundColor(.secondary)
                 TextField("output name", text: $s.outName)
-                    .textFieldStyle(.roundedBorder).frame(width: 170).disabled(s.exporting)
-                Toggle("Set FPS", isOn: $s.fpsOn).toggleStyle(.checkbox).disabled(s.exporting)
-                    .help("Override frame rate. Off = keep source fps.")
-                TextField(s.srcFps > 0 ? String(Int(s.srcFps.rounded())) : "fps", text: $s.fpsText)
-                    .textFieldStyle(.roundedBorder).frame(width: 44)
-                    .disabled(!s.fpsOn || s.exporting)
-                Spacer()
-                Button("Estimate size") { estimateSize() }
-                    .disabled(s.inputURL == nil || s.exporting || s.estimating)
-                Picker("", selection: $s.outFormat) {
-                    Section {
-                        Text("MP4").tag("MP4")
-                        Text("GIF").tag("GIF")
-                        Text("WebM").tag("WEBM")
-                        Text("Web (webm + gif)").tag("Web")
-                    }
-                    Section("More formats") {
-                        Text("MOV").tag("MOV")
-                        Text("M4V").tag("M4V")
-                        Text("MKV").tag("MKV")
-                        Text("AVI").tag("AVI")
-                        Text("WMV").tag("WMV")
-                        Text("FLV").tag("FLV")
-                        Text("MPEG-TS (.ts)").tag("TS")
-                        Text("MPEG (.mpg)").tag("MPG")
-                        Text("3GP").tag("3GP")
-                        Text("F4V").tag("F4V")
-                    }
-                }.frame(width: 160).labelsHidden().disabled(s.exporting)
-                Button(action: { chooseExportFolder() }) {
-                    Label(s.exportFolder.lastPathComponent, systemImage: "folder")
-                }.disabled(s.exporting).help("Set export location (currently: \(s.exportFolder.path))")
-                Button(s.exporting ? "Exporting…" : (s.queue.count > 1 ? "Export & Next" : "Export")) { export() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(s.inputURL == nil || s.exporting || s.estimating)
+                    .textFieldStyle(.roundedBorder).frame(width: 130).disabled(s.exporting)
+                captionsMenu
+                exportControls
             }
+            .sectionCard()
 
             statusBar
         }
         .padding(14)
-        .frame(minWidth: 780, minHeight: 640)
+        .frame(minWidth: 620, minHeight: 620)
         .contentShape(Rectangle())
         .onTapGesture { outFocus = nil }   // click anywhere outside the fields to deselect
         .onAppear { enumerateScreens() }
@@ -834,17 +972,173 @@ struct ContentView: View {
 
     func evenInt(_ v: CGFloat) -> Int { let i = Int(v.rounded()); return max(2, i - i % 2) }
 
-    var qualityHint: String {
-        switch s.quality {
-        case "Fidelity":  return "Preserves maximum detail — file size is not a concern."
-        case "Optimized": return "Smallest reasonable — stronger compression."
-        default:          return "Balanced — slight compression at near-original quality."
+    // Instant, no-encode size model for the live readout. Rough by design: scales a
+    // per-pixel-per-frame bitrate by the CRF curve (~6 CRF ≈ half the size).
+    func liveBytes(_ fmt: String) -> Double {
+        let dur = max(0.05, s.trimEnd - s.trimStart)
+        let px = Double(max(2, s.outW)) * Double(max(2, s.outH))
+        let src = s.srcFps > 0 ? s.srcFps : 30
+        let fps = Double(fpsOverride() ?? Int(src.rounded()))
+        let q = min(max(s.quality, 0), 1)
+        switch fmt {
+        case "GIF":
+            let gfps = 20 - q * 8
+            let bpp = 0.5 - q * 0.3                       // bytes per pixel-frame (palettized)
+            return px * gfps * dur * bpp
+        case "WEBM":
+            let crf = 18 + q * 22
+            let bpp = 0.05 * pow(2.0, (31 - crf) / 6)
+            let abits = (192 - q * 96) * 1000 * dur
+            return (bpp * px * fps * dur + abits) / 8
+        case "Web":
+            return liveBytes("WEBM") + liveBytes("GIF")
+        case "MPG", "WMV":
+            let crf = 14 + q * 16
+            let bpp = 0.08 * pow(2.0, (22 - crf) / 6) * 2.2   // older codecs ≈ 2× larger
+            return (bpp * px * fps * dur + 192 * 1000 * dur) / 8
+        default:                                          // H.264 family
+            let crf = 14 + q * 16
+            let bpp = 0.08 * pow(2.0, (22 - crf) / 6)
+            let abits = (256 - q * 160) * 1000 * dur
+            return (bpp * px * fps * dur + abits) / 8
         }
+    }
+
+    // Rough size of an embedded soft-subtitle track (mov_text). Only when "Embed
+    // subs" is on and the container can carry it (mp4 family). Text-only, so small.
+    func captionBytes() -> Double {
+        guard s.capBurn, ["MP4","MOV","M4V"].contains(s.outFormat) else { return 0 }
+        let dur = max(0.05, s.trimEnd - s.trimStart)
+        return dur * 30   // ≈ 30 bytes/sec of dialogue
+    }
+
+    // A fingerprint of every setting that affects output size; the measured
+    // ("Harder estimate") result is only shown while it still matches.
+    var estSig: String {
+        "\(s.outFormat)|\(Int(s.quality * 100))|\(fpsOverride() ?? -1)|\(s.outW)x\(s.outH)|"
+        + "\(Int(s.trimStart * 10))-\(Int(s.trimEnd * 10))|\(s.capBurn)"
+    }
+    var isMeasured: Bool { s.hardBytes != nil && s.hardSig == estSig }
+    // Bytes to display: measured if fresh, else the instant live model. Captions added on top.
+    var shownBytes: Double {
+        (isMeasured ? s.hardBytes! : liveBytes(s.outFormat)) + captionBytes()
+    }
+
+    // Compact estimate card — sits to the right of the three sliders, height-locked
+    // to them. Two text lines + the Harder-estimate button so it never grows taller.
+    @ViewBuilder var liveReadout: some View {
+        if let input = s.inputURL {
+            let est = shownBytes
+            let orig = fileBytes(input.path)
+            let savings = orig > 0 ? (1 - est / orig) * 100 : 0
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Image(systemName: isMeasured ? "checkmark.seal.fill" : "wand.and.stars")
+                        .font(.system(size: 11)).foregroundColor(.accentColor)
+                    Text("≈ \(humanSize(est))").font(.system(size: 13, weight: .semibold))
+                    Text(s.outFormat).font(.system(size: 10)).foregroundColor(.secondary)
+                    if orig > 0 {
+                        Text(savings >= 0 ? "−\(Int(savings.rounded()))%" : "+\(Int((-savings).rounded()))%")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(savings >= 0 ? .green : .orange)
+                    }
+                }
+                Text("\(orig > 0 ? "was \(humanSize(orig)) · " : "")\(qLabel(s.quality)) · \(isMeasured ? "measured" : "live")")
+                    .font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
+                Spacer(minLength: 2)
+                Button(s.estimating ? "Estimating…" : "Harder estimate") { hardEstimate() }
+                    .font(.system(size: 11)).frame(maxWidth: .infinity)
+                    .disabled(s.exporting || s.estimating)
+                    .help("Encode a short real sample for a more accurate number, then update the figures above.")
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .background(RoundedRectangle(cornerRadius: 4).fill(Color.accentColor.opacity(0.10)))
+        }
+    }
+
+    // Caption options as a dropdown of checkboxes (fits on the export row).
+    var captionsLabel: String {
+        let n = [s.capBurn, s.capSrt, s.capTxt].filter { $0 }.count
+        return n > 0 ? "Generate captions (\(n))" : "Generate captions"
+    }
+    // A popover (not a Menu) so it stays open while you tick several boxes;
+    // clicking outside dismisses it.
+    @ViewBuilder var captionsMenu: some View {
+        Button(action: { captionsOpen.toggle() }) {
+            HStack(spacing: 4) {
+                Image(systemName: "captions.bubble")
+                Text(captionsLabel)
+                Image(systemName: "chevron.down").font(.system(size: 9))
+            }
+        }
+        .disabled(s.exporting)
+        .popover(isPresented: $captionsOpen, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Embed subs", isOn: $s.capBurn).toggleStyle(.checkbox)
+                    .help("Embed a toggleable subtitle track in the MP4 (mov_text). MP4 only.")
+                Toggle("Save .srt", isOn: $s.capSrt).toggleStyle(.checkbox)
+                    .help("Save a separate .srt subtitle file next to the export.")
+                Toggle("Transcript (.txt)", isOn: $s.capTxt).toggleStyle(.checkbox)
+                    .help("Save the spoken text as a .txt file.")
+                if (s.capBurn || s.capSrt || s.capTxt) && !whisperAvailable {
+                    Divider()
+                    Text("⚠︎ whisper not found").font(.system(size: 10)).foregroundColor(.orange)
+                } else if s.capBurn || s.capSrt || s.capTxt {
+                    Divider()
+                    Text("Adds a transcription pass").font(.system(size: 10)).foregroundColor(.secondary)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    // Format picker + export location + Export button — lives in the bottom-right bar.
+    @ViewBuilder var exportControls: some View {
+        Picker("", selection: $s.outFormat) {
+            Section {
+                Text("MP4").tag("MP4")
+                Text("GIF").tag("GIF")
+                Text("WebM").tag("WEBM")
+                Text("Web (webm + gif)").tag("Web")
+            }
+            Section("More formats") {
+                Text("MOV").tag("MOV")
+                Text("M4V").tag("M4V")
+                Text("MKV").tag("MKV")
+                Text("AVI").tag("AVI")
+                Text("WMV").tag("WMV")
+                Text("FLV").tag("FLV")
+                Text("MPEG-TS (.ts)").tag("TS")
+                Text("MPEG (.mpg)").tag("MPG")
+                Text("3GP").tag("3GP")
+                Text("F4V").tag("F4V")
+            }
+        }.frame(width: 120).labelsHidden().disabled(s.exporting)
+        Button(action: { chooseExportFolder() }) {
+            Label(s.exportFolder.lastPathComponent, systemImage: "folder")
+        }.disabled(s.exporting).help("Set export location (currently: \(s.exportFolder.path))")
+            .lineLimit(1)
+        Button(s.exporting ? "Exporting…" : (s.queue.count > 1 ? "Export & Next" : "Export")) { export() }
+            .buttonStyle(.borderedProminent)
+            .disabled(s.inputURL == nil || s.exporting)
+    }
+
+    // While idle with a clip loaded, the bar summarizes the current state + tips
+    // instead of the stale load message.
+    var idleHint: String {
+        guard let input = s.inputURL else { return s.status }
+        let res = "\(Int(s.srcW))×\(Int(s.srcH))"
+        let len = mmss(s.trimEnd - s.trimStart)
+        let src = humanSize(fileBytes(input.path))
+        return "\(res) · \(len) · \(src) source — drag the handles to trim; lower the sliders to shrink the file."
     }
 
     // Bottom feedback bar: spinner while working, colored result otherwise.
     var statusBar: some View {
-        HStack(spacing: 8) {
+        // Show the live state summary when idle with a clip; transient messages otherwise.
+        let showHint = s.inputURL != nil && s.statusKind == "info"
+        return HStack(spacing: 8) {
             switch s.statusKind {
             case "work":
                 ProgressView().controlSize(.small).scaleEffect(0.8)
@@ -855,7 +1149,7 @@ struct ContentView: View {
             default:
                 Image(systemName: "info.circle").foregroundColor(.secondary)
             }
-            Text(s.status)
+            Text(showHint ? idleHint : s.status)
                 .font(.system(size: 11))
                 .foregroundColor(s.statusKind == "ok" ? .green : (s.statusKind == "err" ? .red : .secondary))
                 .lineLimit(2)
@@ -863,7 +1157,7 @@ struct ContentView: View {
         }
         .padding(.horizontal, 10).padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.12)))
+        .background(RoundedRectangle(cornerRadius: 4).fill(Color.gray.opacity(0.12)))
     }
 
     // MARK: queue
@@ -879,7 +1173,8 @@ struct ContentView: View {
         return items.filter { Self.acceptedExts.contains($0.pathExtension.lowercased()) }
     }
 
-    // Collect every dropped file/folder into the queue, then load the first.
+    // Collect every dropped file/folder and APPEND to the queue (don't replace).
+    // Jumps to the first newly-added clip so you see what you just dropped.
     func loadDropped(_ providers: [NSItemProvider]) {
         let group = DispatchGroup()
         let lock = DispatchQueue(label: "drop.collect")
@@ -900,8 +1195,10 @@ struct ContentView: View {
             files = files.filter { Self.acceptedExts.contains($0.pathExtension.lowercased()) }
                          .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             guard !files.isEmpty else { return }
-            s.queue = files; s.queueIndex = 0
-            load(files[0])
+            let firstNew = s.queue.count          // index where the new clips start
+            s.queue += files
+            s.queueIndex = firstNew
+            load(s.queue[firstNew])
         }
     }
 
@@ -1008,6 +1305,7 @@ struct ContentView: View {
                 }
                 try await rec.start(displayID: displayID, sourceRect: sourceRect, pixelW: pxW, pixelH: pxH, micOn: s.micOn, sysAudio: s.sysAudioOn, cursor: s.cursorOn)
                 s.recording = true
+                if s.regionOn { s.regionSelector?.setRecording(true) }   // fade region UI to a thin outline
                 s.recStart = Date(); s.recElapsed = 0
                 s.recTimer?.invalidate()
                 s.recTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
@@ -1023,6 +1321,7 @@ struct ContentView: View {
 
     func endRecordingUI() {
         s.recording = false
+        s.regionSelector?.setRecording(false)
         s.recTimer?.invalidate(); s.recTimer = nil
     }
 
@@ -1033,6 +1332,7 @@ struct ContentView: View {
         Task { @MainActor in
             await rec.stop()
             s.recording = false
+            s.regionSelector?.setRecording(false)
             s.recorder = nil
             if let url = rec.outputURL, fileBytes(url.path) > 1000 {
                 NSSound(named: "Glass")?.play()
@@ -1058,6 +1358,9 @@ struct ContentView: View {
             let dims = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","csv=p=0", url.path])
             let durStr = runTool(gFFprobe, ["-v","error","-show_entries","format=duration","-of","csv=p=0", url.path])
             let fpsStr = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","csv=p=0", url.path])
+            // Embedded subtitle/caption track? (any subtitle stream → yes)
+            let subStr = runTool(gFFprobe, ["-v","error","-select_streams","s","-show_entries","stream=index","-of","csv=p=0", url.path])
+            let hasSubs = !subStr.isEmpty
             let parts = dims.split(separator: ",")
             let w = parts.count > 0 ? CGFloat(Int(parts[0]) ?? 0) : 0
             let h = parts.count > 1 ? CGFloat(Int(parts[1]) ?? 0) : 0
@@ -1086,28 +1389,35 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 s.srcW = w; s.srcH = h; s.duration = dur
                 s.trimStart = 0; s.trimEnd = dur; s.current = 0
+                s.cropOn = false            // crop is opt-in per clip
                 s.resetCropFull()
                 s.previewURL = URL(fileURLWithPath: previewPath)
+                s.player.appliesMediaSelectionCriteriaAutomatically = false   // don't auto-show "default" subs
                 let item = AVPlayerItem(url: s.previewURL!)
                 s.player.replaceCurrentItem(with: item)
                 s.attachObserver()
                 s.seek(0)
                 s.loading = false
                 s.srcFps = fps
-                if !s.fpsOn { s.fpsText = fps > 0 ? String(Int(fps.rounded())) : "" }
+                s.fps = fps > 0 ? fps : 30   // fps slider starts at the source rate (= no change)
+                // Native previews (mp4/mov/m4v) carry the subtitle track; the proxy doesn't.
+                s.hasCaptions = hasSubs && Self.nativePreviewExts.contains(ext)
+                s.applyCaptions()            // never show subtitles in the preview
                 s.outName = "clip"
                 // default output to the detected input type
                 s.outFormat = (ext == "gif") ? "GIF" : (ext == "webm" ? "WEBM" : "MP4")
-                s.setStatus("\(Int(w))×\(Int(h)), \(mmss(dur)) — drag the yellow box to crop, the handles to trim.", "info")
+                s.setStatus("Loaded \(url.lastPathComponent)", "info")
             }
         }
     }
 
     // MARK: export
 
-    // Target fps when the checkbox is on and the field is a valid number; else nil (keep source).
+    // Target fps from the slider; nil (keep source) when it sits at the source rate.
     func fpsOverride() -> Int? {
-        guard s.fpsOn, let v = Int(s.fpsText.trimmingCharacters(in: .whitespaces)), v > 0 else { return nil }
+        let v = Int(s.fps.rounded())
+        guard v > 0 else { return nil }
+        if s.srcFps > 0, abs(Double(v) - s.srcFps) < 0.5 { return nil }   // at source → no -r
         return min(v, 240)
     }
 
@@ -1206,7 +1516,7 @@ struct ContentView: View {
         let posLbl = isBatch ? " · clip \(s.queueIndex + 1)/\(s.queue.count)" : ""
 
         s.exporting = true
-        s.setStatus(wantCaps ? "Transcribing…" : "Exporting \(fmt) · \(quality)\(posLbl)…", "work")
+        s.setStatus(wantCaps ? "Transcribing…" : "Exporting \(fmt) · \(qLabel(quality))\(posLbl)…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
             var burnSrt: String? = nil
             if wantCaps {
@@ -1220,7 +1530,7 @@ struct ContentView: View {
                 if wantTxt, let txt = caps.txt {
                     try? FileManager.default.copyItem(atPath: txt, toPath: self.uniqueOutputURL(folder, outBase, "txt").path)
                 }
-                DispatchQueue.main.async { s.setStatus("Exporting \(fmt) · \(quality)\(posLbl)…", "work") }
+                DispatchQueue.main.async { s.setStatus("Exporting \(fmt) · \(qLabel(quality))\(posLbl)…", "work") }
             }
             let p = plan(fmt, quality, crop, fpsOv)
             let err = runTool(gFFmpeg, ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),
@@ -1251,26 +1561,24 @@ struct ContentView: View {
         }
     }
 
-    // Estimate output size by encoding a short sample at the real settings and
-    // scaling by the full trim duration. Honest because CRF/VP9 sizes depend on
-    // content and can't be derived from settings alone.
-    func estimateSize() {
+    // "Harder estimate": encode a short real sample at the actual export settings and
+    // extrapolate to the full trim. More accurate than the live model (CRF/VP9 sizes
+    // depend on content); the result replaces the auto numbers until a setting changes.
+    func hardEstimate() {
         guard let input = s.inputURL else { return }
         let (crop, st, durSel) = cropTrim()
-        // Sample from ~1/4 in (skip any atypical opening) over a longer window so a
-        // single keyframe doesn't dominate and inflate the extrapolation.
+        // Sample from ~1/4 in (skip any atypical opening) over a window long enough
+        // that a single keyframe doesn't dominate and inflate the extrapolation.
         let sampleDur = min(4.0, max(0.5, durSel))
         let sampleStart = st + max(0, (durSel - sampleDur) * 0.25)
         let factor = durSel / sampleDur
         let fmt = s.outFormat
         let tmp = NSTemporaryDirectory()
+        let sig = estSig
+        let quality = s.quality, fpsOv = fpsOverride()
 
         s.estimating = true
-        s.setStatus("Estimating \(fmt) size…", "work")
-        let quality = s.quality
-        let fpsOv = fpsOverride()
-        // Original file size, to show the savings ("… (was 106 MB MP4)").
-        let wasStr = " (was \(humanSize(fileBytes(input.path))) \(input.pathExtension.uppercased()))"
+        s.setStatus("Running harder estimate (\(fmt))…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
             // Encode a sample with the SAME plan() settings export will use.
             func sample(_ f: String) -> Double {
@@ -1280,18 +1588,17 @@ struct ContentView: View {
                                       "-vf",p.vf] + args(p.codec) + [o])
                 return fileBytes(o)
             }
-            var msg = ""
+            let bytes: Double
             switch fmt {
-            case "GIF": msg = "≈ \(humanSize(sample("GIF") * factor)) GIF"
-            case "WEBM": msg = "≈ \(humanSize(sample("WEBM") * factor)) WebM"
-            case "Web":
-                let w = sample("WEBM") * factor, g = sample("GIF") * factor
-                msg = "≈ \(humanSize(w + g)) total  (webm \(humanSize(w)) + gif \(humanSize(g)))"
-            default: msg = "≈ \(humanSize(sample(fmt) * factor)) \(fmt)"
+            case "Web":  bytes = (sample("WEBM") + sample("GIF")) * factor
+            case "GIF":  bytes = sample("GIF") * factor
+            case "WEBM": bytes = sample("WEBM") * factor
+            default:     bytes = sample(fmt) * factor
             }
             DispatchQueue.main.async {
                 s.estimating = false
-                s.setStatus("\(msg)\(wasStr) · \(quality) · \(mmss(durSel)) — rough estimate; low-motion reads high", "ok")
+                s.hardBytes = bytes; s.hardSig = sig
+                s.setStatus("Measured ≈ \(humanSize(bytes + captionBytes())) from a \(mmss(sampleDur)) sample.", "ok")
             }
         }
     }
@@ -1315,7 +1622,7 @@ struct ContentView: View {
         let gifArgs = ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pg.vf, gif.path]
 
         s.exporting = true
-        s.setStatus("Exporting Web · \(s.quality) → \(base)_forweb…", "work")
+        s.setStatus("Exporting Web · \(qLabel(s.quality)) → \(base)_forweb…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
             try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
             let e1 = runTool(gFFmpeg, webmArgs)

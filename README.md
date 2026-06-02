@@ -1,65 +1,72 @@
 # SimpleClips
 
-SimpleClips is a native macOS app for turning screen recordings and existing video
-files into short, polished clips. Record or drop in footage, crop and trim it
-visually, set the exact output size, add captions, and export to the format you
-need. It runs entirely on your machine with no network access.
+SimpleClips is a native macOS app for turning screen recordings and existing videos
+into short, polished clips. Record or drop in footage, crop and trim it visually, dial
+in the exact size and quality, add captions, and export to the format you need.
+Everything runs on your Mac, with no network access.
 
-## For video editors
+## Features
 
-**Record your screen.** Capture a full display, pick a specific monitor (on-screen
-numbers tell you which is which), or drag a resizable box over just the region you
-want. The box floats above fullscreen apps. You can include the cursor, your
-microphone, and system audio.
+**Record your screen.** Capture a full display, choose a specific monitor (on-screen
+numbers show you which is which), or drag a resizable box over just the region you
+want. The region box floats above fullscreen apps and stays in place as you switch
+desktops, and you can include the cursor, your microphone, and system audio. While
+recording, the region fades to a thin outline you can click straight through.
 
 **Bring in almost any video.** Drop in MP4, MOV, M4V, GIF, WebM, MKV, AVI, WMV, FLV,
-TS, MPG/MPEG, 3GP, F4V, and more, one file or a whole batch. Formats macOS can't play
-back natively get a fast preview proxy automatically, so scrubbing always works. Your
-original file is never modified; all editing and export run on it directly.
+TS, MPG, MPEG, 3GP, F4V, and more, a single file or a whole batch. Anything macOS
+cannot play back natively gets a fast preview automatically, so scrubbing always
+works. Your original file is never changed.
 
-**Crop and trim.** Drag the four corner handles to crop. Drag the yellow end handles
-on the timeline to trim (each has an arrow showing which way it moves).
+**Crop and trim visually.** Turn on Crop and drag the corner dots to frame your shot.
+Drag the handles on the timeline to set the start and end. A live readout shows the
+resolution, length, and source size as you work.
 
-**Set the output size exactly.** Type the output width or height in pixels. The other
-dimension follows the crop's aspect ratio automatically, and you can't upscale past
-the crop, so you only ever resize down from real pixels.
+**Size it exactly.** A resolution slider scales the output as a percentage of your
+crop, or you can type the exact width or height in pixels. The other dimension follows
+automatically, and you can only scale down from real pixels, never upscale.
 
-**Pick a quality target.** High fidelity, Balanced, or High optimization. These change
-compression only and never touch resolution, so the size you set is the size you get.
-High fidelity favors detail over file size; High optimization favors small files.
+**Choose quality with one slider.** Slide from Optimized to High fidelity. This changes
+compression only and never touches resolution, so the size you set is the size you get.
+Fidelity favors detail, optimization favors small files.
 
-**Set the frame rate** if you want, or keep the source.
+**Set the frame rate.** Lower the frame rate to shrink the file, or keep the source
+rate. The slider never exceeds the original frame rate.
 
-**Add captions, generated locally.** Transcription runs offline with Whisper. Embed a
-toggleable subtitle track in the MP4, save a sidecar `.srt`, and/or save a plain
+**See the size before you export.** A live estimate shows the projected file size and
+how much smaller it is than the source, for example "saves 78%". Run Harder estimate
+for an exact figure measured from a real sample of your settings.
+
+**Add captions, generated on your Mac.** Transcription runs entirely offline. Embed a
+subtitle track you can toggle on and off, save a sidecar `.srt`, and save a plain
 `.txt` transcript.
 
 **Export to whatever you need.** MP4, GIF, WebM, a Web bundle (a `.webm` plus a `.gif`
 in a `*_forweb` folder), or MOV, M4V, MKV, AVI, WMV, FLV, TS, MPG, 3GP, F4V. One click
-drops the file into your chosen folder with auto-numbered names (`clip`, `clip_1`, and
-so on) and never overwrites. Run **Estimate size** first to preview the result and how
-much smaller it is than the source, for example `71.5 MB MP4 (was 106 MB MP4)`.
+saves the file to your chosen folder with auto-numbered names (`clip`, `clip_1`, and so
+on) so nothing is ever overwritten.
 
-## For developers
+**Work through a batch.** Drop in several files or a folder and move through them with
+Prev, Next, and Remove, exporting each with the same settings.
 
-Architecture:
+## How it works
 
-- One Swift file (`Sources/ClipEditor.swift`), SwiftUI plus AppKit, built with
-  `swiftc`. There is no Xcode project.
-- Screen capture uses ScreenCaptureKit in-process (`SCStream` plus
-  `SCRecordingOutput`), so the permission attaches to the app and the recorder writes
-  the movie itself.
-- All media work calls `ffmpeg`, `ffprobe`, and `whisper-cli` through `Process` with
-  argument arrays, never a shell string, so filenames and paths cannot inject
-  commands.
-- Transcription runs offline against a bundled GGML model; the ggml compute backends
-  (CPU, Metal, BLAS) load from inside the app.
-- No networking anywhere. The app opens zero connections.
+SimpleClips is a single Swift app built with SwiftUI and AppKit. Everything happens
+locally, and the app opens zero network connections.
 
-`plan()` is the single source of truth for encode settings, shared by export and the
-size estimator so the estimate matches the real output. The quality presets map to
-codec settings (CRF, preset, bitrate) and never to scaling; resolution comes only from
-the crop and the output-size fields.
+- Screen capture uses ScreenCaptureKit in process, so the recording permission
+  attaches to the app and the recorder writes the movie itself.
+- All media work runs through `ffmpeg`, `ffprobe`, and `whisper-cli`. These are called
+  with argument arrays rather than a shell command, so filenames and paths can never
+  inject commands.
+- Captions are transcribed offline against a bundled Whisper model. The ggml compute
+  backends (CPU, Metal, BLAS) load from inside the app.
+- A single planning step is the source of truth for encode settings, shared by both the
+  export and the size estimate, so the estimate reflects exactly what export will
+  produce. Quality maps to compression settings only, never to scaling, and resolution
+  comes solely from your crop and the size fields.
+- Formats macOS cannot preview natively get a fast hardware proxy so the timeline stays
+  smooth, while editing and export always run on the original file at full quality.
 
 ## Build
 
@@ -67,20 +74,23 @@ the crop and the output-size fields.
 # Dev build: compiles only, uses Homebrew ffmpeg/whisper at runtime.
 brew install ffmpeg whisper-cpp dylibbundler
 ./scripts/fetch-model.sh           # downloads the Whisper model (about 142 MB)
-./build.sh                         # writes build/SimpleClips.app (ad-hoc signed)
+./build.sh                         # writes build/SimpleClips.app
+open "build/SimpleClips.app"
 
 # Self-contained build: bundles ffmpeg, whisper, the ggml backends, and the model.
 ./build.sh --bundle                # about 182 MB, runs with no Homebrew present
-open "build/SimpleClips.app"
 ```
 
-You need the Xcode command line tools (`swiftc`) and the macOS 15+ SDK. The `--bundle`
-build also needs `dylibbundler` plus the Homebrew tools and the model on the build
-machine, which get copied into the app. This has been verified: with `--bundle`,
-ffmpeg, whisper, and the ggml compute backends all run from inside the bundle with an
-empty PATH and no Homebrew.
+You need the Xcode command line tools (`swiftc`) and the macOS 15 or later SDK. The
+`--bundle` build also needs `dylibbundler` plus the Homebrew tools and the model on the
+build machine, which get copied into the app. With `--bundle`, ffmpeg, whisper, and the
+ggml compute backends all run from inside the bundle with an empty PATH and no Homebrew.
 
-### How self-containment works (`--bundle`)
+`build.sh` signs with a local code-signing certificate from your keychain when one is
+present, which keeps the Screen Recording permission stable across rebuilds, and falls
+back to ad-hoc signing otherwise.
+
+## How self-containment works (`--bundle`)
 
 `scripts/bundle-deps.sh` copies the tools into the app and rewrites their dylib load
 paths so nothing points back at Homebrew:
@@ -99,26 +109,6 @@ Captions use soft, embedded subtitles (`mov_text`) plus the sidecar `.srt` and `
 Burned-in captions need an ffmpeg built with `libass`, which the bundled ffmpeg does
 not include.
 
-## Shipping it for download
-
-The app is self-contained. To distribute it to other people you still need:
-
-1. An Apple Developer Program membership, which provides a Developer ID Application
-   certificate.
-2. A signed and notarized build:
-   ```bash
-   SIGN_ID="Developer ID Application: Your Name (TEAMID)" ./build.sh --bundle
-   ./scripts/notarize.sh "build/SimpleClips.app"
-   ```
-   `build.sh` applies the hardened runtime and `Resources/entitlements.plist` when it
-   sees a Developer ID (or `NOTARIZE=1`); `notarize.sh` submits to Apple and staples
-   the ticket. Local and self-signed builds use plain signing with no timestamp.
-3. A universal build if you want Intel support. The current build is arm64 only,
-   because the bundled tools are arm64.
-4. macOS 15 or later (ScreenCaptureKit `SCRecordingOutput`).
-5. Compliance with ffmpeg's license. Bundling ffmpeg built with x264/x265 makes the
-   distribution GPL, so provide the corresponding source or a written offer.
-
 ## Layout
 
 ```
@@ -128,11 +118,11 @@ Resources/entitlements.plist hardened-runtime entitlements (notarization)
 build.sh                     compile, optionally bundle, sign
 scripts/bundle-deps.sh       bundle ffmpeg/whisper/backends/model into the app
 scripts/fetch-model.sh       download the Whisper model
-scripts/notarize.sh          notarize and staple (after you have a Developer ID)
+scripts/notarize.sh          notarize and staple
 ```
 
 ## Licensing
 
-The app code is yours to license. Third-party components: ffmpeg (LGPL or GPL
-depending on the build), whisper.cpp (MIT), and the Whisper models (MIT). Review those
-obligations before redistributing binaries.
+The app code is yours to license. Third-party components: ffmpeg (LGPL or GPL depending
+on the build), whisper.cpp (MIT), and the Whisper models (MIT). Review those obligations
+before redistributing binaries.

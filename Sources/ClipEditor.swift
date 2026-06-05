@@ -194,6 +194,11 @@ func extFor(_ format: String) -> String {
     }
 }
 
+// Private temp folder holding copies of imported clips, so the queue survives
+// the originals being moved/deleted. Wiped on quit (see AppDelegate).
+let gStashDir = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("SimpleClips-stash", isDirectory: true)
+
 // ---- screen recorder (in-process ScreenCaptureKit) ------------------------
 
 @available(macOS 15, *)
@@ -220,7 +225,11 @@ final class ScreenRecorder: NSObject, SCStreamDelegate, SCRecordingOutputDelegat
         config.width = max(2, pixelW - pixelW % 2)
         config.height = max(2, pixelH - pixelH % 2)
         if let r = sourceRect { config.sourceRect = r }
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        // Cap capture at the display's real refresh rate (120 on ProMotion, 60
+        // otherwise) instead of a hard 30. ScreenCaptureKit is variable-rate, so
+        // this is a ceiling — frames are only emitted when the screen changes.
+        let screenFps = Self.displayMaxFPS(display.displayID)
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(screenFps))
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = cursor
         config.captureMicrophone = micOn
@@ -262,6 +271,19 @@ final class ScreenRecorder: NSObject, SCStreamDelegate, SCRecordingOutputDelegat
     }
     func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
         if let c = finishContinuation { finishContinuation = nil; c.resume() }
+    }
+
+    // The display's max refresh rate in Hz, via its NSScreen; defaults to 60.
+    static func displayMaxFPS(_ id: CGDirectDisplayID) -> Int {
+        if let ns = NSScreen.screens.first(where: {
+            ($0.deviceDescription[NSDeviceDescriptionKey(rawValue: "NSScreenNumber")] as? NSNumber)?.uint32Value == id
+        }), ns.maximumFramesPerSecond > 0 {
+            return ns.maximumFramesPerSecond
+        }
+        if let mode = CGDisplayCopyDisplayMode(id), mode.refreshRate > 0 {
+            return Int(mode.refreshRate.rounded())
+        }
+        return 60
     }
 
     // SCStreamDelegate
@@ -1278,11 +1300,22 @@ struct ContentView: View {
             files = files.filter { Self.acceptedExts.contains($0.pathExtension.lowercased()) }
                          .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             guard !files.isEmpty else { return }
+            let stashed = files.map { self.stash($0) }   // copy in so originals can move/vanish
             let firstNew = s.queue.count          // index where the new clips start
-            s.queue += files
+            s.queue += stashed
             s.queueIndex = firstNew
             load(s.queue[firstNew])
         }
+    }
+
+    // Copy an imported file into our own stash so the queue keeps working even
+    // if the user later moves or deletes the original. Falls back to the
+    // original path if the copy fails for any reason.
+    func stash(_ url: URL) -> URL {
+        try? FileManager.default.createDirectory(at: gStashDir, withIntermediateDirectories: true)
+        let dst = gStashDir.appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+        do { try FileManager.default.copyItem(at: url, to: dst); return dst }
+        catch { return url }
     }
 
     func navQueue(_ d: Int) {
@@ -1440,7 +1473,11 @@ struct ContentView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             let dims = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","csv=p=0", url.path])
             let durStr = runTool(gFFprobe, ["-v","error","-show_entries","format=duration","-of","csv=p=0", url.path])
-            let fpsStr = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","csv=p=0", url.path])
+            // r_frame_rate is the *nominal* rate from the container timescale —
+            // for ScreenCaptureKit .mov files that's a bogus 600. avg_frame_rate
+            // is the true measured rate (frames ÷ duration), so prefer it.
+            let rFpsStr = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=r_frame_rate","-of","csv=p=0", url.path])
+            let avgFpsStr = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=avg_frame_rate","-of","csv=p=0", url.path])
             // Embedded subtitle/caption track? (any subtitle stream → yes)
             let subStr = runTool(gFFprobe, ["-v","error","-select_streams","s","-show_entries","stream=index","-of","csv=p=0", url.path])
             let hasSubs = !subStr.isEmpty
@@ -1448,11 +1485,16 @@ struct ContentView: View {
             let w = parts.count > 0 ? CGFloat(Int(parts[0]) ?? 0) : 0
             let h = parts.count > 1 ? CGFloat(Int(parts[1]) ?? 0) : 0
             var dur = Double(durStr) ?? 0
-            // r_frame_rate is like "30000/1001"; evaluate to a Double.
-            var fps = 0.0
-            let fp = fpsStr.split(separator: "/")
-            if fp.count == 2, let n = Double(fp[0]), let d = Double(fp[1]), d > 0 { fps = n / d }
-            else { fps = Double(fpsStr) ?? 0 }
+            // Rates come as "30000/1001" or "29.7"; evaluate either form to a Double.
+            func rate(_ str: String) -> Double {
+                let p = str.split(separator: "/")
+                if p.count == 2, let n = Double(p[0]), let d = Double(p[1]), d > 0 { return n / d }
+                return Double(str) ?? 0
+            }
+            let avgFps = rate(avgFpsStr), rFps = rate(rFpsStr)
+            // Prefer the measured average; fall back to nominal only if it's absent.
+            var fps = avgFps > 0 ? avgFps : rFps
+            fps = (fps * 100).rounded() / 100
 
             // AVPlayer only decodes mp4/mov/m4v. For anything else (webm, mkv, avi,
             // gif, wmv, …) make a fast hardware proxy mp4 so the preview/scrubbing
@@ -1773,6 +1815,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular); NSApp.activate(ignoringOtherApps: true)
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
+
+    // Wipe stashed imports plus leftover recordings/preview proxies on quit.
+    func applicationWillTerminate(_ n: Notification) {
+        let fm = FileManager.default
+        try? fm.removeItem(at: gStashDir)
+        if let items = try? fm.contentsOfDirectory(atPath: NSTemporaryDirectory()) {
+            for f in items where f.hasPrefix("mbrec_") || f.hasPrefix("scpreview_") {
+                try? fm.removeItem(atPath: NSTemporaryDirectory() + f)
+            }
+        }
+    }
 }
 
 @main

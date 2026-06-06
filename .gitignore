@@ -15,3 +15,9 @@ windows/resources/mac/bin/
 windows/models/
 windows/build/*
 !windows/build/icon*
+
+# ===== Downloadable build artifacts (too large for git; distribute via Releases) =====
+# Keep the per-platform README placeholders, ignore the actual binaries.
+downloadable builds/**/*.exe
+downloadable builds/**/*.dmg
+downloadable builds/**/*.zip

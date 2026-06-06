@@ -134,8 +134,49 @@ npm run dist:win       # build installer + portable into dist/
   extraction so `signAndEditExecutable: true` (needed for the portable exe icon) succeeds
   without signing. Unsigned build → SmartScreen warning.
 - electron's own binary download via `extract-zip` silently fails here; if `node_modules/
-  electron/dist` is missing, download the electron zip and `Expand-Archive` it in, then
-  write `node_modules/electron/path.txt` = `electron.exe`.
+  electron/dist` is missing after `npm install`, the zip is usually already cached at
+  `%LOCALAPPDATA%\electron\Cache`. `Expand-Archive` it into `node_modules/electron/dist`
+  and write `node_modules/electron/path.txt` = `electron.exe`. Concrete commands are in
+  [Producing a downloadable build](#producing-a-downloadable-build) below.
+
+### Producing a downloadable build
+
+`node_modules/`, `dist/`, the whisper binaries, and the model are all git-ignored, so a
+fresh checkout needs a few steps before `dist:win` works. This is the exact sequence used
+to produce the shipped portable build (run from `windows/`):
+
+```powershell
+$env:ELECTRON_RUN_AS_NODE = $null      # clear the leaked Claude Code env (see gotchas)
+npm install                            # 400+ packages
+
+# Electron's binary downloads to the cache but fails to extract here (see gotchas).
+# The zip is normally already at %LOCALAPPDATA%\electron\Cache; expand it in by hand:
+$zip  = Get-ChildItem "$env:LOCALAPPDATA\electron\Cache" -Recurse -Filter "electron-v*-win32-x64.zip" | Select-Object -First 1
+$dist = "node_modules\electron\dist"
+Remove-Item $dist -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory $dist | Out-Null
+Expand-Archive $zip.FullName $dist -Force
+Set-Content "node_modules\electron\path.txt" "electron.exe" -NoNewline -Encoding ascii
+
+npm run fetch:whisper                  # only if resources/win/bin + models aren't present
+npm run dist:win                       # output -> windows/dist/
+```
+
+`dist:win` emits two artifacts (~434 MB each) into `windows/dist/`:
+- `SimpleClips <ver>.exe` is the **portable / standalone** single exe (nothing to install).
+- `SimpleClips Setup <ver>.exe` is the NSIS installer.
+
+Both bundle ffmpeg/ffprobe (asar-unpacked), `whisper-cli` + DLLs, and the captions model,
+so they run fully offline.
+
+**Where shipped builds live.** Copy the artifact(s) from `windows/dist/` into
+`downloadable builds/Windows/` (the portable exe is renamed `SimpleClips-<ver>-portable.exe`
+for clarity). That folder's `README.md` is tracked, but the binaries are git-ignored
+(`downloadable builds/**/*.exe`, `.dmg`, `.zip`) because they exceed GitHub's 100 MB file
+limit. **Distribute via GitHub Releases**, not the repo.
+
+**Unsigned.** With no code-signing cert, first run shows a SmartScreen "unknown publisher"
+prompt (More info, then Run anyway). See the `winCodeSign` gotcha above.
 
 ### Headless app verification (no GUI needed)
 Set env `SMOKE=1`, `SMOKE_SAMPLE=<mp4>`, `SMOKE_OUT=<dir>` and launch electron; a

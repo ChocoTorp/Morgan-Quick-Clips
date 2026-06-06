@@ -788,7 +788,7 @@ struct ContentView: View {
     @State private var recordHover = false        // record button hover state
     @State private var cancelHover = false        // cancel button hover state
     @State private var sliderColH: CGFloat = 0   // measured height of the 3-slider column
-    @FocusState private var outFocus: Int?   // 1 = width field, 2 = height field
+    @FocusState private var outFocus: Int?   // 1 = width field, 2 = height field, 3 = fps field
 
     var body: some View {
         VStack(spacing: 10) {
@@ -1013,8 +1013,15 @@ struct ContentView: View {
                             // Max = the source fps (you can only reduce fps, never add frames).
                             Slider(value: $s.fps, in: 1...max(2, s.srcFps), step: 1)
                                 .disabled(s.inputURL == nil || s.exporting)
-                            Text("\(Int(s.fps.rounded())) fps").font(.system(size: 11, design: .monospaced))
-                                .frame(width: 64, alignment: .trailing)
+                            // Typeable too (like Windows): clamped to 1…source rate — downscale only.
+                            TextField("", value: Binding(
+                                get: { Int(s.fps.rounded()) },
+                                set: { v in let maxFps = Int(max(2, s.srcFps).rounded())
+                                            s.fps = Double(min(maxFps, max(1, v))) }),
+                                format: .number).textFieldStyle(.roundedBorder).frame(width: 40)
+                                .disabled(s.inputURL == nil || s.exporting).focused($outFocus, equals: 3)
+                            Text("fps").font(.system(size: 11)).foregroundColor(.secondary)
+                                .frame(width: 20, alignment: .leading)
                         }
                     }
                     .background(GeometryReader { g in

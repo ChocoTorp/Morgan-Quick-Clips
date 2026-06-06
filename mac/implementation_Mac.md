@@ -1,6 +1,6 @@
 # SimpleClips — Implementation
 
-How the app is actually built. Pairs with [spec.md](spec.md) (what each feature is
+How the app is actually built. Pairs with [spec.md](../spec.md) (what each feature is
 *for*). All UI and logic live in a single Swift file: [Sources/ClipEditor.swift](Sources/ClipEditor.swift)
 (~1.8k lines). Media work shells out to `ffmpeg`/`ffprobe`/`whisper-cli`.
 
@@ -124,7 +124,8 @@ A single `VStack` of cards (`SectionCard` modifier):
    never clipped.
 3. **Sliders + estimate card** — Resolution (slider + exact W×H px fields), Quality
    (inverted so the knob reads Optimized→Fidelity while `quality` stays 0=fidelity
-   underneath), FPS (max = source). The estimate card is height-locked to the slider
+   underneath), FPS (slider + a typeable field, both clamped to the source rate, matching
+   the Windows build). The estimate card is height-locked to the slider
    column via a measured `GeometryReader` height.
 4. **Output row** — name field, captions popover, format picker, export-folder button,
    Export button.

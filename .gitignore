@@ -1,10 +1,17 @@
-# build output
-build/
+# ===== macOS Swift app (mac/) =====
+mac/build/
 *.app
-
-# models (large; fetch with scripts/fetch-model.sh)
+# models are large; the mac app fetches to $HOME (see mac/scripts/fetch-model.sh)
 *.bin
-models/
 
 # macOS cruft
 .DS_Store
+
+# ===== Windows / Electron app (windows/) =====
+windows/node_modules/
+windows/dist/
+windows/resources/win/bin/
+windows/resources/mac/bin/
+windows/models/
+windows/build/*
+!windows/build/icon*

@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; media-src 'self' file: blob:; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    />
+    <title>SimpleClips</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- recording toolbar -->
+      <div class="card row" id="recBar">
+        <div class="row" id="recIdle">
+          <div class="seg" id="modeSeg">
+            <button data-mode="region">Region</button>
+            <button data-mode="full" class="on">Fullscreen</button>
+          </div>
+          <div class="pop">
+            <button id="screenBtn">Screen 0 ▾</button>
+            <div class="pop-menu up hidden" id="screenMenu"></div>
+          </div>
+          <span class="muted">|</span>
+          <label class="chk"><input type="checkbox" id="micChk" /> Mic</label>
+          <select id="micDevice" class="small hidden" title="Microphone device" style="max-width:160px"></select>
+          <label class="chk"><input type="checkbox" id="sysChk" /> Screen audio</label>
+          <div class="spacer"></div>
+          <button class="record" id="recordBtn">● Record Screen</button>
+        </div>
+        <div class="row hidden" id="recActive">
+          <span class="rec-dot">● REC</span>
+          <div class="spacer"></div>
+          <button class="danger" id="stopBtn">■ Stop 0:00</button>
+        </div>
+      </div>
+
+      <!-- preview + clip bar + timeline -->
+      <div class="preview-unit" id="unit">
+        <div class="preview" id="preview">
+          <video id="video" tabindex="-1"></video>
+          <div class="crop-layer hidden" id="cropLayer"></div>
+          <div class="hint" id="hint">
+            <div class="big">▣</div>
+            <div>Drop video, .gif, or multiple files here</div>
+            <div class="small" style="margin-top:6px">or <a href="#" id="browseLink" style="color:var(--accent)">browse…</a></div>
+          </div>
+          <div class="loading hidden" id="loading">Loading preview…</div>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="subbar row hidden" id="clipBar">
+          <span id="clipLabel" class="small"></span>
+          <span id="capNote" class="small muted hidden">(has captions)</span>
+          <div class="spacer"></div>
+          <button id="cropToggle" class="small">Crop</button>
+          <span id="cropSize" class="small mono muted hidden"></span>
+          <button id="cropReset" class="small hidden">Reset crop</button>
+          <button id="prevBtn" class="small hidden">◀ Prev</button>
+          <button id="nextBtn" class="small hidden">Next ▶</button>
+          <button id="removeBtn" class="small">Remove</button>
+        </div>
+
+        <div class="subbar" id="playRow">
+          <div class="row">
+            <button class="play-btn" id="playBtn">▶</button>
+            <div class="timeline" id="timeline">
+              <div class="track" id="track">
+                <div class="sel" id="sel"></div>
+                <div class="playhead" id="playhead"></div>
+              </div>
+              <div class="handle" id="hStart"></div>
+              <div class="handle" id="hEnd"></div>
+            </div>
+          </div>
+          <div class="row small mono muted" style="margin-top:6px">
+            <span id="timeLabel">Time 0:00 / 0:00</span>
+            <div class="spacer"></div>
+            <span id="trimLabel">Trim 0:00 → 0:00 (0:00)</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- sliders + estimate -->
+      <div class="card sliders hidden" id="sliders">
+        <div class="col">
+          <div class="slider-row">
+            <span class="lbl">Resolution</span>
+            <input type="range" id="resSlider" min="10" max="100" step="1" value="100" />
+            <span class="val mono" id="resPct">100%</span>
+            <input type="number" id="outW" /> <span class="muted">×</span> <input type="number" id="outH" /> <span class="muted">px</span>
+          </div>
+          <div class="slider-row">
+            <span class="lbl" title="Smallest file at this resolution">Smaller</span>
+            <input type="range" id="qSlider" min="0" max="1" step="0.01" value="0.5" />
+            <span class="lbl" style="text-align:right" title="Best quality (larger file)">Fidelity</span>
+          </div>
+          <div class="slider-row">
+            <span class="lbl">FPS</span>
+            <input type="range" id="fpsSlider" min="1" max="60" step="1" value="30" />
+            <input type="number" id="fpsNum" min="1" step="1" style="width:52px" /> <span class="muted">fps</span>
+          </div>
+        </div>
+        <div class="estimate" id="estimate">
+          <div><span class="big" id="estBytes">≈ —</span> <span class="muted small" id="estFmt"></span> <span class="save" id="estSave"></span></div>
+          <div class="small muted" id="estSub"></div>
+          <div class="spacer"></div>
+          <button id="hardEstBtn" class="small">Harder estimate</button>
+        </div>
+      </div>
+
+      <!-- output row -->
+      <div class="card row" id="outputRow">
+        <span class="muted" style="font-weight:600">Output</span>
+        <div class="spacer"></div>
+        <span class="muted small">Name</span>
+        <input type="text" id="outName" value="clip" style="width:130px" />
+        <div class="pop">
+          <button id="capBtn">⊞ Generate captions ▾</button>
+          <div class="pop-menu hidden" id="capMenu">
+            <label class="chk"><input type="checkbox" id="capEmbed" /> Embed subs (MP4)</label>
+            <label class="chk"><input type="checkbox" id="capSrt" /> Save .srt</label>
+            <label class="chk"><input type="checkbox" id="capTxt" /> Transcript (.txt)</label>
+            <div class="small muted" id="capNoteMenu"></div>
+          </div>
+        </div>
+        <select id="formatSel">
+          <optgroup label="Common">
+            <option value="MP4">MP4</option>
+            <option value="GIF">GIF</option>
+            <option value="WEBM">WebM</option>
+            <option value="Web">Web (webm + gif)</option>
+          </optgroup>
+          <optgroup label="More formats">
+            <option value="MOV">MOV</option>
+            <option value="M4V">M4V</option>
+            <option value="MKV">MKV</option>
+            <option value="AVI">AVI</option>
+            <option value="WMV">WMV</option>
+            <option value="FLV">FLV</option>
+            <option value="TS">MPEG-TS (.ts)</option>
+            <option value="MPG">MPEG (.mpg)</option>
+            <option value="3GP">3GP</option>
+            <option value="F4V">F4V</option>
+          </optgroup>
+        </select>
+        <button id="folderBtn">📁 Desktop</button>
+        <button class="primary" id="exportBtn">Export</button>
+      </div>
+
+      <!-- status bar -->
+      <div class="card row status" id="status">
+        <span id="statusIcon">ℹ</span>
+        <span id="statusText">Drop video, .gif, or multiple files here.</span>
+        <div class="bar hidden" id="progBar"><i id="progFill"></i></div>
+        <span class="small mono muted hidden" id="progPct"></span>
+        <div class="spacer"></div>
+        <button class="danger small hidden" id="cancelBtn">Cancel</button>
+      </div>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

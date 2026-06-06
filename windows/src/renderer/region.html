@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'" />
+    <style>
+      html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; user-select: none; cursor: default; }
+      #frame {
+        position: absolute; inset: 0; box-sizing: border-box;
+        border: 2px solid #3b82f6; border-radius: 2px;
+        transition: border-color 0.25s ease, border-width 0.25s ease;
+        /* The frame/middle is NOT a control — clicks pass through to apps behind. */
+      }
+      #frame.recording { border: 1px solid #ffffff; }
+      /* The translucent-black resolution box is the move handle. */
+      #label {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        font: 600 12px system-ui, "Segoe UI", sans-serif; color: #fff;
+        background: rgba(0,0,0,0.55); padding: 8px 14px; border-radius: 4px; white-space: nowrap;
+        cursor: move; transition: opacity 0.25s ease;
+      }
+      .grip {
+        position: absolute; width: 18px; height: 18px; background: #3b82f6; border-radius: 0; /* sharp corners */
+        transition: opacity 0.25s ease;
+      }
+      #br { right: 0; bottom: 0; cursor: nwse-resize; }
+      #bl { left: 0; bottom: 0; cursor: nesw-resize; }
+      #tr { right: 0; top: 0; cursor: nesw-resize; }
+      #tl { left: 0; top: 0; cursor: nwse-resize; }
+      /* While recording: fade to a thin white outline with an empty middle. */
+      .recording .grip, .recording #label { opacity: 0; pointer-events: none; }
+    </style>
+  </head>
+  <body>
+    <div id="frame">
+      <div id="label">640 × 360</div>
+      <div class="grip" id="tl"></div>
+      <div class="grip" id="tr"></div>
+      <div class="grip" id="bl"></div>
+      <div class="grip" id="br"></div>
+    </div>
+    <script src="region.js"></script>
+  </body>
+</html>

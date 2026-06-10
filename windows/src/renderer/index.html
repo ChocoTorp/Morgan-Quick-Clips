@@ -10,6 +10,12 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <!-- custom title bar: native one is hidden, Windows overlays min/max/close on the right -->
+    <div id="titlebar">
+      <img src="../../build/icon.png" alt="" />
+      <span class="name">SimpleClips</span>
+      <span class="ver" id="titleVer"></span>
+    </div>
     <div id="app">
       <!-- recording toolbar -->
       <div class="card row" id="recBar">
@@ -40,6 +46,8 @@
       <div class="preview-unit" id="unit">
         <div class="preview" id="preview">
           <video id="video" tabindex="-1"></video>
+          <!-- low-res scrub proxy: shown (over the master) only while dragging the timeline -->
+          <video id="scrubVideo" class="hidden" tabindex="-1" muted></video>
           <div class="crop-layer hidden" id="cropLayer"></div>
           <div class="hint" id="hint">
             <div class="big">▣</div>
@@ -157,6 +165,7 @@
         <div class="bar hidden" id="progBar"><i id="progFill"></i></div>
         <span class="small mono muted hidden" id="progPct"></span>
         <div class="spacer"></div>
+        <button class="small hidden" id="revealBtn">Show in folder</button>
         <button class="danger small hidden" id="cancelBtn">Cancel</button>
       </div>
     </div>

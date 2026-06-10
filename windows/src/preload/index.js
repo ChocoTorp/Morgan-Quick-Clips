@@ -6,6 +6,7 @@ contextBridge.exposeInMainWorld('clips', {
   // info + dialogs
   toolsInfo: () => ipcRenderer.invoke('tools:info'),
   defaultFolder: () => ipcRenderer.invoke('app:defaultFolder'),
+  version: () => ipcRenderer.invoke('app:version'),
   openFiles: () => ipcRenderer.invoke('dialog:openFiles'),
   expandPaths: (paths) => ipcRenderer.invoke('media:expandPaths', paths),
   chooseFolder: (current) => ipcRenderer.invoke('dialog:chooseFolder', current),
@@ -14,7 +15,9 @@ contextBridge.exposeInMainWorld('clips', {
 
   // media engine
   probe: (filePath) => ipcRenderer.invoke('media:probe', filePath),
+  packets: (filePath) => ipcRenderer.invoke('media:packets', filePath),
   proxy: (filePath) => ipcRenderer.invoke('media:proxy', filePath),
+  scrubProxy: (filePath) => ipcRenderer.invoke('media:scrubProxy', filePath),
   fileSize: (filePath) => ipcRenderer.invoke('media:fileSize', filePath),
   estimate: (params) => ipcRenderer.invoke('media:estimate', params),
   hardEstimate: (opts) => ipcRenderer.invoke('media:hardEstimate', opts),
@@ -26,9 +29,13 @@ contextBridge.exposeInMainWorld('clips', {
     return () => ipcRenderer.removeListener('media:progress', handler);
   },
 
+  // reveal a saved file in Explorer
+  reveal: (filePath) => ipcRenderer.invoke('shell:reveal', filePath),
+
   // screen recording
   screenSources: () => ipcRenderer.invoke('screen:sources'),
-  saveRecording: (buffer, region, fps) => ipcRenderer.invoke('rec:save', { buffer, region, fps }),
+  saveRecording: (buffer, region, fps, duration, container, h264) =>
+    ipcRenderer.invoke('rec:save', { buffer, region, fps, duration, container, h264 }),
 
   // region overlay window
   regionOpen: () => ipcRenderer.invoke('region:open'),

@@ -20,14 +20,19 @@ const S = {
   outFormat: 'MP4', outName: 'clip',
   capEmbed: false, capSrt: false, capTxt: false,
   hasCaptions: false,
+  scrubProxy: null, // low-res densely-keyframed sidekick file; null until built
   queue: [], queueIndex: 0,
   exportFolder: '', folderName: 'Desktop',
   playing: false, exporting: false, exportCancelled: false,
   origBytes: 0,
-  // Calibration from a "Harder estimate": multiplier that corrects the live model's
-  // systematic error for this clip/format, so the live number stays anchored to reality
-  // and scales sensibly as sliders move (instead of jumping back to a wildly-off value).
-  calib: null, calibFormat: '',
+  // Content anchor: the source's own per-second video bytes ({ cum, total, srcW, srcH,
+  // srcCrf }), fetched once per clip. Makes the live estimate content-aware from load —
+  // a fixed bits-per-pixel constant is off by 10-30x for screen recordings.
+  anchor: null, srcCrf: 20,
+  // Calibration from a "Harder estimate": the measured bytes and the settings they were
+  // measured at. The correction factor is recomputed as measured/model on every read, so
+  // it stays consistent even if the model improves later (e.g. the anchor arriving).
+  calibBytes: 0, calibParams: null, calibFormat: '',
   whisper: false,
   // recording
   mode: 'full', sources: [], selectedIndex: 0,
@@ -60,6 +65,7 @@ function fittedRect(cw, ch, sw, sh) {
 }
 
 const video = $('video');
+const scrubVideo = $('scrubVideo');
 
 function setStatus(msg, kind = 'info') {
   $('statusText').textContent = msg;
@@ -68,6 +74,15 @@ function setStatus(msg, kind = 'info') {
   if (kind === 'ok') el.classList.add('ok');
   if (kind === 'err') el.classList.add('err');
   $('statusIcon').textContent = kind === 'ok' ? '✓' : kind === 'err' ? '⚠' : kind === 'work' ? '◐' : 'ℹ';
+  $('revealBtn').classList.add('hidden'); // only the status that saved something offers it
+}
+
+// Offer a "Show in folder" button next to the current status (cleared by the next status).
+let revealPath = '';
+function showReveal(p) {
+  if (!p) return;
+  revealPath = p;
+  $('revealBtn').classList.remove('hidden');
 }
 
 // ---- fps override ----------------------------------------------------------
@@ -122,13 +137,62 @@ function liveBytes(fmt, p) {
   }
 }
 
+// Content-anchored estimate — mirrors src/main/engine/estimate.js anchoredBytes so the
+// readout stays synchronous. Scales the source's REAL bytes for the trim range by the
+// CRF curve, pixel ratio (^0.85), fps ratio (^0.6) and a codec factor. Returns null when
+// it can't apply (no anchor yet, or GIF whose size is palette-driven) → model fallback.
+function anchoredBytes(fmt, p, anchor) {
+  if (!anchor || !anchor.cum || !(anchor.total > 0)) return null;
+  if (fmt === 'GIF') return null;
+  if (fmt === 'Web') {
+    const w = anchoredBytes('WEBM', p, anchor);
+    return w == null ? null : w + liveBytes('GIF', p);
+  }
+  const cum = anchor.cum;
+  const max = cum.length - 1;
+  const at = (t) => {
+    const x = clamp(t, 0, max);
+    const i = Math.floor(x);
+    return i >= max ? cum[max] : cum[i] + (cum[i + 1] - cum[i]) * (x - i);
+  };
+  const srcBytes = Math.max(0, at(p.trimEnd) - at(p.trimStart));
+  if (!(srcBytes > 0)) return null;
+  const dur = Math.max(0.05, p.trimEnd - p.trimStart);
+  const q = Math.min(Math.max(p.quality, 0), 1);
+  const srcPx = Math.max(2, anchor.srcW) * Math.max(2, anchor.srcH);
+  const outPx = Math.max(2, p.outW) * Math.max(2, p.outH);
+  const srcFps = p.srcFps > 0 ? p.srcFps : 30;
+  const fps = p.fpsOverride != null ? p.fpsOverride : Math.round(srcFps);
+  const outCrf = 14 + q * 16;
+  const codecF = fmt === 'WEBM' ? 0.7 : fmt === 'MPG' || fmt === 'WMV' ? 2.2 : 1.0;
+  const video =
+    srcBytes *
+    Math.pow(2, ((anchor.srcCrf || 20) - outCrf) / 6) *
+    Math.pow(outPx / srcPx, 0.85) *
+    Math.pow(fps / srcFps, 0.6) *
+    codecF;
+  const akbps = fmt === 'WEBM' ? 192 - q * 96 : fmt === 'MPG' || fmt === 'WMV' ? 192 : 256 - q * 160;
+  return video + (akbps * 1000 * dur) / 8;
+}
+
+// Best available base estimate: content-anchored once packet data is in, model until then.
+function estBase(fmt, p) {
+  const a = anchoredBytes(fmt, p, S.anchor);
+  return a != null ? a : liveBytes(fmt, p);
+}
+
 let estimating = false; // a real measurement (sample encode) is running
 function updateEstimate() {
   if (!S.input) return;
   const p = estParams();
-  let base = liveBytes(S.outFormat, p);
-  const calibrated = S.calib && S.calibFormat === S.outFormat;
-  if (calibrated) base *= S.calib; // anchor to the measured sample, scale from there
+  let base = estBase(S.outFormat, p);
+  let calibrated = false;
+  if (S.calibBytes > 0 && S.calibFormat === S.outFormat && S.calibParams) {
+    // Correct by the measured/model ratio AT THE MEASURED SETTINGS, then let the model
+    // extrapolate from there as sliders move.
+    const m = estBase(S.outFormat, S.calibParams);
+    if (m > 0) { base *= S.calibBytes / m; calibrated = true; }
+  }
   const shown = base + captionBytes(p);
   $('estBytes').textContent = '≈ ' + humanSize(shown);
   $('estFmt').textContent = S.outFormat;
@@ -138,9 +202,21 @@ function updateEstimate() {
     saveEl.textContent = pct >= 0 ? `−${Math.round(pct)}%` : `+${Math.round(-pct)}%`;
     saveEl.className = 'save ' + (pct >= 0 ? 'pos' : 'neg');
   } else saveEl.textContent = '';
-  $('estSub').textContent =
-    (S.origBytes > 0 ? `was ${humanSize(S.origBytes)} · ` : '') + qLabel(S.quality) +
-    ' · ' + (estimating ? 'measuring…' : calibrated ? 'calibrated' : 'live');
+  // Each segment is an unbreakable span, so the line wraps only at the · separators
+  // (never inside "fidelity-leaning" or "115.6 MB").
+  const sub = $('estSub');
+  sub.textContent = '';
+  [
+    S.origBytes > 0 ? `was ${humanSize(S.origBytes)}` : null,
+    qLabel(S.quality),
+    estimating ? 'measuring…' : calibrated ? 'calibrated' : S.anchor ? 'live' : 'rough',
+  ].filter(Boolean).forEach((text, i) => {
+    if (i) sub.appendChild(document.createTextNode(' · '));
+    const span = document.createElement('span');
+    span.className = 'seg';
+    span.textContent = text;
+    sub.appendChild(span);
+  });
 }
 // Now instant (the model is a cheap synchronous calc); kept as an alias for call sites.
 function scheduleEstimate() { updateEstimate(); }
@@ -149,12 +225,23 @@ function scheduleEstimate() { updateEstimate(); }
 async function load(path) {
   S.input = path;
   S.ext = (path.split('.').pop() || '').toLowerCase();
+  S.anchor = null; // stale packet data must never price a different clip
+  // Effective quality of the source for the anchored estimate: ~CRF 20 is typical for
+  // delivered H.264 (including our recording masters, hardware-encoded at a healthy
+  // bitrate). Only shifts the anchor's baseline — the hard estimate calibrates residue.
+  S.srcCrf = 20;
   $('loading').classList.remove('hidden');
   $('hint').classList.add('hidden');
   setStatus('Inspecting ' + path.split(/[\\/]/).pop() + '…', 'work');
   // Switching clips always starts paused — reset both the state and the button glyph so the
   // new clip shows ▶ (previously it kept the old clip's pause icon).
   video.pause(); S.playing = false; $('playBtn').textContent = '▶';
+  // Reset the scrub machinery for the new clip.
+  S.scrubProxy = null;
+  scrubbing = false;
+  scrubVideo.classList.add('hidden');
+  scrubVideo.removeAttribute('src'); scrubVideo.load();
+  mainSeek.reset(); proxySeek.reset();
 
   const [info, size] = await Promise.all([window.clips.probe(path), window.clips.fileSize(path)]);
   S.srcW = info.w; S.srcH = info.h; S.duration = info.duration; S.srcFps = info.fps;
@@ -171,12 +258,28 @@ async function load(path) {
   S.trimStart = 0; S.trimEnd = S.duration; S.current = 0;
   S.cropOn = false;
   resetCropFull();
-  // The clip's real frame rate. Recordings are constant-rate at the display refresh, so this
-  // reads e.g. 240; imports read their own rate. The fps control only ever reduces from here.
+  // The clip's real frame rate; the fps control only ever reduces from here. Default the
+  // export rate to ≤60 — Windows' stock player rejects H.264 above 60fps at screen sizes —
+  // but the slider still reaches the source rate for deliberate high-fps exports.
   const srcFps = info.fps > 0 ? Math.round(info.fps) : 30;
   S.srcFps = srcFps;
-  S.fps = srcFps;
-  S.calib = null; S.calibFormat = '';
+  S.fps = Math.min(srcFps, 60);
+  S.calibBytes = 0; S.calibParams = null; S.calibFormat = '';
+  // Content anchor for the live estimate: per-second source bytes (demux only, ~0.3s
+  // for a 5-min clip). Arrives async; the estimate uses the rough model until then.
+  window.clips.packets(path).then((a) => {
+    if (S.input !== path || !a || !(a.total > 0)) return;
+    S.anchor = { cum: a.cum, total: a.total, srcW: S.srcW, srcH: S.srcH, srcCrf: S.srcCrf };
+    updateEstimate();
+  });
+  // Scrub proxy builds in the background while the user works; dragging uses the master
+  // until it's ready, then silently switches to the instant low-res version.
+  window.clips.scrubProxy(path).then((p) => {
+    if (S.input !== path || !p) return;
+    S.scrubProxy = p;
+    scrubVideo.src = fileURL(p);
+    scrubVideo.load();
+  });
   S.hasCaptions = info.hasSubs && NATIVE.has(S.ext);
   S.outName = 'clip';
   S.outFormat = S.ext === 'gif' ? 'GIF' : S.ext === 'webm' ? 'WEBM' : 'MP4';
@@ -229,6 +332,8 @@ function removeCurrent() {
   S.queue.splice(Math.min(S.queueIndex, S.queue.length - 1), 1);
   if (!S.queue.length) {
     S.input = null; S.srcW = 0; video.removeAttribute('src'); video.load();
+    S.scrubProxy = null; scrubVideo.classList.add('hidden');
+    scrubVideo.removeAttribute('src'); scrubVideo.load();
     $('hint').classList.remove('hidden');
     setStatus('Queue empty — drop or record a clip.', 'info');
     renderAll();
@@ -238,7 +343,30 @@ function removeCurrent() {
   }
 }
 
-// ---- playback --------------------------------------------------------------
+// ---- playback / seeking ------------------------------------------------------
+// Coalesced seeks: at most ONE seek in flight per element; while the decoder works,
+// only the LATEST requested time is kept. Without this, a fast drag queues dozens of
+// seeks and the picture replays them in slow motion long after the mouse stopped.
+function coalescedSeeker(el) {
+  let busy = false;
+  let pending = -1;
+  el.addEventListener('seeked', () => {
+    if (pending >= 0) { const t = pending; pending = -1; el.currentTime = t; }
+    else busy = false;
+  });
+  return {
+    to(t) {
+      t = Math.max(0, t);
+      if (busy) { pending = t; return; }
+      busy = true;
+      el.currentTime = t;
+    },
+    reset() { busy = false; pending = -1; }, // src changed → in-flight seek never lands
+  };
+}
+const mainSeek = coalescedSeeker(video);
+const proxySeek = coalescedSeeker(scrubVideo);
+
 function togglePlay() {
   if (!S.input) return;
   if (S.playing) { video.pause(); S.playing = false; }
@@ -248,12 +376,34 @@ function togglePlay() {
   }
   $('playBtn').textContent = S.playing ? '❚❚' : '▶';
 }
-function seek(t) { video.currentTime = Math.max(0, t); S.current = t; renderTimeline(); }
+function seek(t) { S.current = t; mainSeek.to(t); renderTimeline(); }
+
+// While dragging, seek the low-res scrub proxy instead of the full-res master (a master
+// with multi-second keyframe gaps can't keep up with a fast drag). The master settles on
+// the exact frame when the drag ends.
+let scrubbing = false;
+function beginScrub() {
+  scrubbing = true;
+  if (S.scrubProxy) scrubVideo.classList.remove('hidden');
+}
+function scrubTo(t) {
+  S.current = t;
+  if (S.scrubProxy) proxySeek.to(t);
+  else mainSeek.to(t);
+  renderTimeline();
+}
+function endScrub() {
+  scrubbing = false;
+  scrubVideo.classList.add('hidden');
+  mainSeek.to(S.current); // full-quality frame exactly where the drag ended
+}
 
 function tick() {
   if (S.input) {
-    S.current = video.currentTime;
-    if (S.playing && S.trimEnd > S.trimStart && S.current >= S.trimEnd - 0.02) seek(S.trimStart);
+    if (!scrubbing) {
+      S.current = video.currentTime;
+      if (S.playing && S.trimEnd > S.trimStart && S.current >= S.trimEnd - 0.02) seek(S.trimStart);
+    }
     renderTimeline();
   }
   requestAnimationFrame(tick);
@@ -338,18 +488,23 @@ function renderTimeline() {
 function timelineDrag(which) {
   return (e) => {
     e.preventDefault();
+    beginScrub();
     const move = (ev) => {
       const tl = $('timeline').getBoundingClientRect();
       const W = Math.max(1, tl.width - INSET * 2);
       const dur = Math.max(S.duration, 0.001);
       const t = clamp(((ev.clientX - tl.left - INSET) / W) * dur, 0, S.duration);
-      if (which === 'start') { S.trimStart = clamp(t, 0, S.trimEnd - 0.1); seek(S.trimStart); }
-      else if (which === 'end') { S.trimEnd = clamp(t, S.trimStart + 0.1, S.duration); seek(S.trimEnd); }
-      else seek(t);
+      if (which === 'start') { S.trimStart = clamp(t, 0, S.trimEnd - 0.1); scrubTo(S.trimStart); }
+      else if (which === 'end') { S.trimEnd = clamp(t, S.trimStart + 0.1, S.duration); scrubTo(S.trimEnd); }
+      else scrubTo(t);
       renderTimeline(); scheduleEstimate();
     };
     move(e);
-    const up = () => { document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', up); };
+    const up = () => {
+      endScrub();
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+    };
     document.addEventListener('pointermove', move);
     document.addEventListener('pointerup', up);
   };
@@ -470,18 +625,25 @@ async function doExport() {
   if (res.cancelled) setStatus('Export canceled.', 'info');
   else if (res.ok) {
     chime();
-    const saved = (res.output || res.folder || '').split(/[\\/]/).pop();
+    const savedPath = res.output || res.folder || '';
+    const saved = savedPath.split(/[\\/]/).pop();
+    // The message is always about THE CLIP just exported (the user may have exported
+    // only this one); with more clips queued after it, advance to the next.
     if (S.queue.length > 1 && S.queueIndex + 1 < S.queue.length) {
       setStatus(`Saved ${saved} — loading clip ${S.queueIndex + 2}/${S.queue.length}…`, 'ok');
       S.queueIndex++; load(S.queue[S.queueIndex]);
-    } else if (S.queue.length > 1) setStatus(`Batch complete — ${S.queue.length} clips exported.`, 'ok');
-    else setStatus('Saved ' + saved, 'ok');
+    } else {
+      setStatus('Saved to ' + savedPath, 'ok');
+      showReveal(savedPath);
+    }
   } else setStatus('Export failed: ' + (res.error || 'unknown'), 'err');
   renderAll();
 }
 
+// Drives the status-bar progress for both exports (id = exportId) and the post-recording
+// encode pass (id = 'rec').
 window.clips.onProgress((p) => {
-  if (p.id !== exportId) return;
+  if (p.id !== exportId && p.id !== 'rec') return;
   $('progFill').style.width = Math.round(p.frac * 100) + '%';
   $('progPct').textContent = Math.round(p.frac * 100) + '%' + (p.which ? ' (' + p.which + ')' : '');
 });
@@ -493,6 +655,7 @@ window.clips.onProgress((p) => {
 async function hardEstimate() {
   if (!S.input || S.exporting || estimating) return;
   const forInput = S.input;
+  const measuredParams = estParams(); // the settings the sample will be encoded at
   estimating = true;
   $('hardEstBtn').textContent = 'Measuring…';
   $('hardEstBtn').disabled = true;
@@ -506,14 +669,15 @@ async function hardEstimate() {
   $('hardEstBtn').textContent = 'Harder estimate';
   $('hardEstBtn').disabled = false;
   if (S.input !== forInput) return; // switched clips mid-measure → discard
-  const model = liveBytes(S.outFormat, estParams());
-  S.calib = bytes > 0 && model > 0 ? bytes / model : null;
+  S.calibBytes = bytes > 0 ? bytes : 0;
+  S.calibParams = measuredParams;
   S.calibFormat = S.outFormat;
   updateEstimate();
 }
 
 // ---- recording -------------------------------------------------------------
 let mediaRecorder = null, recChunks = [], recStream = null, recTimer = null;
+let recStartTs = 0;         // wall-clock start; gives the encode pass its progress total
 let recSourceStreams = [];  // every getUserMedia stream, so we can stop all tracks
 let recAudioCtx = null;     // WebAudio context when mixing >1 audio source
 
@@ -577,9 +741,11 @@ async function startRecording() {
   }
   if (!source) { setStatus('No screen available to record.', 'err'); return; }
 
-  // The recording's frame rate IS the display's refresh rate — a real, constant number the
-  // editor can trust (and that the user can deliberately reduce later). Capture at that rate.
-  const recRate = Math.max(24, Math.min(240, Math.round(refresh || 60)));
+  // Record at the display's refresh rate, capped at 120: keeps high-refresh motion for
+  // deliberate high-fps exports without the absurd encode time of a 240fps master. The
+  // EXPORT defaults to ≤60 regardless (see load()) — H.264 above 60fps at screen
+  // resolutions lands beyond Level 5.2, where Windows' built-in decoder stops.
+  const recRate = Math.max(24, Math.min(120, Math.round(refresh || 60)));
 
   const videoConstraints = {
     mandatory: {
@@ -627,15 +793,43 @@ async function startRecording() {
   }
 
   recChunks = [];
-  const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-    ? 'video/webm;codecs=vp9,opus' : 'video/webm';
-  mediaRecorder = new MediaRecorder(recStream, { mimeType: mime });
+  // Prefer H.264: Chromium encodes it with the platform's HARDWARE encoder (Media
+  // Foundation on Windows), so the finish pass can REMUX instead of re-encoding the
+  // whole recording — that's why the Mac app (which records h264 via ScreenCaptureKit)
+  // is ready instantly. VP9 stays as the fallback for builds without H.264 support.
+  const mime = [
+    'video/mp4;codecs=avc1.640028,mp4a.40.2',
+    'video/mp4;codecs=avc1.640028,opus',
+    'video/x-matroska;codecs=avc1',
+    'video/webm;codecs=h264',
+    'video/webm;codecs=vp9,opus',
+  ].find((m) => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+  const isH264 = mime.includes('avc1') || mime.includes('h264');
+  const container = mime.startsWith('video/mp4') ? 'mp4' : mime.includes('matroska') ? 'mkv' : 'webm';
+  // Explicit bitrate — MediaRecorder's default (~2.5 Mbps) looks awful at screen
+  // resolutions. ~0.05 bits/px/frame, clamped to 8-24 Mbps (the Mac app records at 8M).
+  const set = recStream.getVideoTracks()[0].getSettings();
+  const px = (set.width || 1920) * (set.height || 1080);
+  const videoBits = Math.max(8e6, Math.min(24e6, Math.round(px * recRate * 0.05)));
+  mediaRecorder = new MediaRecorder(recStream, {
+    mimeType: mime, videoBitsPerSecond: videoBits, audioBitsPerSecond: 192000,
+  });
   mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
   mediaRecorder.onstop = async () => {
-    const blob = new Blob(recChunks, { type: 'video/webm' });
+    const blob = new Blob(recChunks, { type: mime });
     const buf = await blob.arrayBuffer();
-    setStatus('Finalizing recording…', 'work');
-    const path = await window.clips.saveRecording(buf, region, recRate);
+    // The wall-clock length of the recording is the finish pass's progress total (the
+    // raw capture has no trustworthy duration header to read it from).
+    const recDur = Math.max(1, (Date.now() - recStartTs) / 1000);
+    setStatus(`${isH264 && !region ? 'Finalizing' : 'Encoding'} recording (${mmss(recDur)})…`, 'work');
+    $('progBar').classList.remove('hidden');
+    $('progPct').classList.remove('hidden');
+    $('progFill').style.width = '0';
+    $('progPct').textContent = '0%';
+    const path = await window.clips.saveRecording(buf, region, recRate, recDur, container, isH264);
+    $('progBar').classList.add('hidden');
+    $('progPct').classList.add('hidden');
+    $('progFill').style.width = '0';
     if (S.mode === 'region') window.clips.regionSetRecording(false);
     if (path) {
       if (!S.queue.length) { S.queue = [path]; S.queueIndex = 0; }
@@ -645,6 +839,7 @@ async function startRecording() {
   };
 
   mediaRecorder.start(1000); // flush a chunk every second (reliable; avoids one-blob failures)
+  recStartTs = Date.now();
   S.recording = true;
   S.recElapsed = 0;
   if (S.mode === 'region') window.clips.regionSetRecording(true);
@@ -747,6 +942,7 @@ function wire() {
   });
   $('exportBtn').addEventListener('click', doExport);
   $('cancelBtn').addEventListener('click', () => { S.exportCancelled = true; window.clips.cancelExport(); });
+  $('revealBtn').addEventListener('click', () => { if (revealPath) window.clips.reveal(revealPath); });
 
   // captions popover
   $('capBtn').addEventListener('click', () => $('capMenu').classList.toggle('hidden'));
@@ -791,6 +987,7 @@ function wire() {
 // ---- boot ------------------------------------------------------------------
 async function boot() {
   wire();
+  $('titleVer').textContent = 'V ' + (await window.clips.version());
   const info = await window.clips.toolsInfo();
   S.whisper = !!info.whisper;
   renderCapNote();

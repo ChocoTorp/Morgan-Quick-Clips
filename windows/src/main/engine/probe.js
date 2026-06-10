@@ -1,6 +1,7 @@
 // Inspect a media file with ffprobe: dimensions, duration, frame rate, subtitles.
 // Ports the four ffprobe calls in load() from the macOS app.
 const { runTool } = require('./ffmpeg');
+const { parsePackets } = require('./estimate');
 
 async function probe(ffprobe, filePath) {
   const dims = await runTool(ffprobe, [
@@ -45,4 +46,15 @@ async function probe(ffprobe, filePath) {
   return { w, h, duration, fps, hasSubs: subStr.length > 0 };
 }
 
-module.exports = { probe };
+// Per-second video byte histogram for the content-anchored size estimate. Demux only
+// (no decode), so it's fast even for long files (~0.3s for a 5-minute recording).
+// Returns { cum, total } — see estimate.parsePackets.
+async function packetStats(ffprobe, filePath) {
+  const csv = await runTool(ffprobe, [
+    '-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'packet=pts_time,size', '-of', 'csv=p=0', filePath,
+  ]);
+  return parsePackets(csv);
+}
+
+module.exports = { probe, packetStats };

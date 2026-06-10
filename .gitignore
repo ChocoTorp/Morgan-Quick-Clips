@@ -18,6 +18,9 @@ windows/build/*
 
 # ===== Downloadable build artifacts (too large for git; distribute via Releases) =====
 # Keep the per-platform README placeholders, ignore the actual binaries.
-downloadable builds/**/*.exe
-downloadable builds/**/*.dmg
-downloadable builds/**/*.zip
+# NOTE: folder is "Downloadable builds" (capital D) — match it exactly for case-sensitive
+# git hosts like GitHub.
+Downloadable builds/**/*.exe
+Downloadable builds/**/*.dmg
+Downloadable builds/**/*.zip
+Downloadable builds/**/*.app/

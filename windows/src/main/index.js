@@ -1,6 +1,6 @@
 // Electron main process — app shell + IPC bridge to the media engine, plus screen
 // enumeration and the floating region-selector window used for region recording.
-const { app, BrowserWindow, ipcMain, dialog, desktopCapturer, screen, session } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, desktopCapturer, screen, session, shell } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -27,6 +27,10 @@ function createWindow() {
     backgroundColor: '#1c1c1e',
     title: 'SimpleClips',
     icon: ICON_PATH,
+    // Native title bar hidden; the renderer draws its own (icon + name + version) and
+    // Windows overlays the min/max/close buttons on top of it.
+    titleBarStyle: 'hidden',
+    titleBarOverlay: { color: '#1c1c1e', symbolColor: '#e6e6e6', height: 34 },
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
@@ -120,6 +124,14 @@ ipcMain.handle('tools:info', () => ({ ...tools, whisper: engine.whisperAvailable
 
 ipcMain.handle('app:defaultFolder', () => app.getPath('desktop'));
 
+// Patch-notes display version: semver 1.0.x → "1.0x" (V1.01, V1.02, ...).
+ipcMain.handle('app:version', () => {
+  const v = app.getVersion().split('.');
+  return v.length === 3 && v[1] === '0' ? `${v[0]}.${String(v[2]).padStart(2, '0')}` : app.getVersion();
+});
+
+ipcMain.handle('shell:reveal', (_e, p) => { shell.showItemInFolder(path.normalize(p)); });
+
 const VIDEO_EXTS = [
   'mp4', 'mov', 'm4v', 'gif', 'webm', 'mkv', 'avi', 'wmv', 'flv', 'ts', 'mts',
   'm2ts', 'mpg', 'mpeg', 'm2v', '3gp', '3g2', 'ogv', 'vob', 'asf', 'f4v', 'divx',
@@ -168,7 +180,18 @@ ipcMain.handle('media:expandPaths', (_e, paths) => {
 // ---- IPC: media engine -----------------------------------------------------
 
 ipcMain.handle('media:probe', (_e, filePath) => engine.probe(tools.ffprobe, filePath));
+ipcMain.handle('media:packets', (_e, filePath) => engine.packetStats(tools.ffprobe, filePath));
 ipcMain.handle('media:proxy', (_e, filePath) => engine.makeProxy(tools, filePath));
+
+// Scrub-proxy builds are best-effort background work: a newer clip's request kills the
+// previous build so we never burn CPU on a clip the user already left.
+let scrubChild = null;
+ipcMain.handle('media:scrubProxy', async (_e, filePath) => {
+  if (scrubChild) { try { scrubChild.kill(); } catch {} }
+  const out = await engine.makeScrubProxy(tools, filePath, { onStart: (c) => { scrubChild = c; } });
+  scrubChild = null;
+  return out;
+});
 ipcMain.handle('media:fileSize', (_e, filePath) => engine.fileBytes(filePath));
 ipcMain.handle('media:estimate', (_e, params) => engine.liveBytes(params.outFormat, params));
 ipcMain.handle('media:hardEstimate', (_e, opts) => engine.hardEstimate({ ...opts, tools }));
@@ -232,7 +255,7 @@ ipcMain.handle('screen:sources', async () => {
       displayId: disp ? disp.id : null,
       bounds: disp ? disp.bounds : null,
       scaleFactor: disp ? disp.scaleFactor : 1,
-      refreshRate: disp ? disp.displayFrequency || 0 : 0, // monitor refresh (Hz) → record fps
+      refreshRate: disp ? disp.displayFrequency || 0 : 0, // monitor refresh (Hz) → record fps (capped to 120 at record time)
     };
   });
 });
@@ -242,8 +265,8 @@ ipcMain.handle('screen:sources', async () => {
 // frame" bug) and, for region recordings, crop to the selected rect in the same pass.
 // Region rect is mapped proportionally (DIP fractions × recorded pixels), so DPI scaling
 // doesn't matter. Returns the final mp4 path (or the raw webm if the finish pass failed).
-ipcMain.handle('rec:save', async (_e, { buffer, region, fps }) => {
-  const raw = path.join(os.tmpdir(), `screc_raw_${Date.now()}.webm`);
+ipcMain.handle('rec:save', async (e, { buffer, region, fps, duration, container, h264 }) => {
+  const raw = path.join(os.tmpdir(), `screc_raw_${Date.now()}.${container || 'webm'}`);
   fs.writeFileSync(raw, Buffer.from(buffer));
 
   const info = await engine.probe(tools.ffprobe, raw); // dims only; duration is untrusted here
@@ -264,10 +287,15 @@ ipcMain.handle('rec:save', async (_e, { buffer, region, fps }) => {
 
   const out = path.join(os.tmpdir(), `screc_${Date.now()}.mp4`);
   const ok = await engine.finishRecording({
-    tools, input: raw, output: out, srcW: info.w, srcH: info.h, crop, fps,
+    tools, input: raw, output: out, srcW: info.w, srcH: info.h, crop, fps, duration,
+    h264: !!h264,
+    onProgress: (frac) => e.sender.send('media:progress', { id: 'rec', frac }),
   });
+  // Keep the raw webm when the finish pass fails — it's the only copy of the recording
+  // (and Chromium can still play it), so deleting it would lose the user's clip.
+  if (!ok) return raw;
   try { fs.unlinkSync(raw); } catch {}
-  return ok ? out : raw;
+  return out;
 });
 
 // ---- IPC: region overlay window --------------------------------------------

@@ -83,7 +83,10 @@ async function exportClip(opts) {
     try { fs.unlinkSync(output); } catch {}
     return { ok: false, output, cancelled: true, error: null };
   }
-  if (fs.existsSync(output)) return { ok: true, output, cancelled: false, error: null };
+  if (res.code === 0 && fs.existsSync(output)) return { ok: true, output, cancelled: false, error: null };
+  // ffmpeg failed mid-encode: remove the half-written file so an unplayable clip is
+  // never left where the "Saved" one should be.
+  try { fs.unlinkSync(output); } catch {}
   return { ok: false, output, cancelled: false, error: res.output.slice(-160) };
 }
 
@@ -122,7 +125,8 @@ async function exportWeb(opts) {
   );
   if (e2.cancelled) { try { fs.rmSync(folder, { recursive: true, force: true }); } catch {} return { ok: false, folder, cancelled: true }; }
 
-  const ok = fs.existsSync(webm) && fs.existsSync(gif);
+  const ok = e1.code === 0 && e2.code === 0 && fs.existsSync(webm) && fs.existsSync(gif);
+  if (!ok) { try { fs.rmSync(folder, { recursive: true, force: true }); } catch {} }
   return { ok, folder, error: ok ? null : (e1.output + e2.output).slice(-140) };
 }
 
@@ -135,44 +139,69 @@ async function hardEstimate(opts) {
   const vfCrop = buildCropFilter({
     srcW: opts.srcW, srcH: opts.srcH, crop: opts.crop, outW: opts.outW, outH: opts.outH,
   });
-  // Sample ~1/4 in over a window long enough that one keyframe doesn't dominate.
-  const sampleDur = Math.min(4.0, Math.max(0.5, durSel));
-  const sampleStart = st + Math.max(0, (durSel - sampleDur) * 0.25);
-  const factor = durSel / sampleDur;
+  // Three short windows spread across the trim (20/50/80%) so one unusually quiet or
+  // busy moment can't skew the whole estimate; short trims collapse to a single window.
+  const wd = 1.5;
+  const windows = durSel <= 6
+    ? [{ start: st, dur: Math.min(4.0, Math.max(0.5, durSel)) }]
+    : [0.2, 0.5, 0.8].map((f) => ({ start: st + (durSel - wd) * f, dur: wd }));
   const tmp = os.tmpdir();
 
   const sample = async (f) => {
     const p = plan(f, quality, vfCrop, opts.fps);
-    const o = path.join(tmp, 'est.' + extFor(f));
-    await runTool(tools.ffmpeg, [
-      '-y', '-v', 'error', '-ss', String(sampleStart), '-i', input, '-t', String(sampleDur),
-      '-vf', p.vf, ...splitArgs(p.codec), o,
-    ]);
-    return fileBytes(o);
+    let bytes = 0;
+    let sampled = 0;
+    for (let i = 0; i < windows.length; i++) {
+      const o = path.join(tmp, `est_${i}.` + extFor(f));
+      await runTool(tools.ffmpeg, [
+        '-y', '-v', 'error', '-ss', String(windows[i].start), '-i', input, '-t', String(windows[i].dur),
+        '-vf', p.vf, ...splitArgs(p.codec), o,
+      ]);
+      bytes += fileBytes(o);
+      sampled += windows[i].dur;
+    }
+    return (bytes * durSel) / sampled; // extrapolate sampled seconds to the full trim
   };
 
-  let bytes;
-  if (format === 'Web') bytes = ((await sample('WEBM')) + (await sample('GIF'))) * factor;
-  else if (format === 'GIF') bytes = (await sample('GIF')) * factor;
-  else if (format === 'WEBM') bytes = (await sample('WEBM')) * factor;
-  else bytes = (await sample(format)) * factor;
-  return bytes;
+  if (format === 'Web') return (await sample('WEBM')) + (await sample('GIF'));
+  if (format === 'GIF') return sample('GIF');
+  if (format === 'WEBM') return sample('WEBM');
+  return sample(format);
 }
 
-// Finish a screen recording: transcode the raw MediaRecorder webm to a clean, seekable
-// h264 mp4 at a CONSTANT frame rate equal to the display's refresh (opts.fps). The whole
-// stream is transcoded (no -ss/-t), which writes a correct duration — fixing the "one
-// frame" bug from MediaRecorder webm having no duration header. For region recordings, crop
-// in the same pass. crop is in recorded pixels: { x, y, w, h } | null (full frame).
+// Finish a screen recording: turn the raw MediaRecorder capture into a clean, seekable
+// mp4 with a correct duration header (MediaRecorder writes none — the "one frame" bug).
 //
-// Why CFR at the display rate (not "passthrough"): the editor — and the person using it —
-// need ONE real, constant number. Screen capture is variable-rate (frames only on change),
-// so passthrough would make a 240Hz recording read as its average (~28fps), which is
-// meaningless to edit from. Locking to the display rate makes the file genuinely that rate;
-// static moments duplicate frames, which x264 compresses to near-nothing.
+// Fast path (opts.h264, no crop): the capture is ALREADY hardware-encoded H.264, so just
+// REMUX — copy the compressed video into the mp4 and re-encode only the audio to AAC
+// (seconds of work regardless of length; this is how the Mac app feels instant). The
+// master keeps the capture's real, variable frame timing.
+//
+// Slow path (VP9 fallback, or region recordings that must crop): full transcode to CFR
+// h264 at the capture rate (opts.fps, ≤120). CFR because a variable-rate transcode of a
+// variable-rate source compounds timing problems, and the editor needs a real number.
+// EXPORTS default to ≤60 regardless: H.264 above 60fps at screen resolutions exceeds
+// Level 5.2, which is where Windows' built-in decoder stops.
+// crop is in recorded pixels: { x, y, w, h } | null (full frame).
 async function finishRecording(opts) {
   const { tools, input, output } = opts;
-  const rate = Math.max(1, Math.min(240, Math.round(opts.fps || 60)));
+  // opts.duration (the renderer's recording clock) is the progress total; the raw
+  // capture's own duration header is missing/untrusted.
+  const run = (args) => runFFmpegProgress(tools.ffmpeg, args, opts.duration || 0, {
+    onStart: opts.onStart, onProgress: opts.onProgress,
+  });
+  const finished = () => fs.existsSync(output) && fileBytes(output) > 1000;
+
+  if (opts.h264 && !opts.crop) {
+    const res = await run([
+      '-y', '-v', 'error', '-progress', 'pipe:1', '-i', input,
+      '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', output,
+    ]);
+    if (res.code === 0 && finished()) return true;
+    // fall through: an odd capture that won't remux still gets the full transcode
+  }
+
+  const rate = Math.max(1, Math.min(120, Math.round(opts.fps || 60)));
   const args = ['-y', '-v', 'error', '-progress', 'pipe:1', '-i', input];
   if (opts.crop) {
     const vf = buildCropFilter({
@@ -185,9 +214,8 @@ async function finishRecording(opts) {
     '-c:v', 'libx264', '-crf', '18', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-movflags', '+faststart', output
   );
-  // total=0: duration is unknown/untrusted for the raw webm, so we don't report a fraction.
-  await runFFmpegProgress(tools.ffmpeg, args, 0, { onStart: opts.onStart, onProgress: opts.onProgress });
-  return fs.existsSync(output) && fileBytes(output) > 1000;
+  const res = await run(args);
+  return res.code === 0 && finished();
 }
 
 module.exports = { buildCropFilter, exportClip, exportWeb, hardEstimate, finishRecording };

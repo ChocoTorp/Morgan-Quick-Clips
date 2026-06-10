@@ -6,10 +6,11 @@
 // and export always run on the ORIGINAL file at full resolution/quality — the proxy only
 // affects what's shown in the player. (On macOS AVPlayer hardware-decodes the original, so
 // it doesn't need this.)
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { runTool } = require('./ffmpeg');
+const { runTool, runFFmpegProgress } = require('./ffmpeg');
 const { fileBytes } = require('./util');
 const { probe } = require('./probe');
 
@@ -62,4 +63,44 @@ async function makeProxy(tools, inputPath) {
   return fileBytes(output) > 1000 ? output : inputPath;
 }
 
-module.exports = { makeProxy, pickVideoEncoder };
+const SCRUB_SIDE = 640;
+const SCRUB_FPS = 15;
+
+// Scrub proxy: an even smaller, densely-keyframed mp4 shown ONLY while the user drags the
+// playhead or trim handles. Seeking H.264 means "decode forward from the previous
+// keyframe", so a full-res master with multi-second keyframe gaps lags badly under a fast
+// drag; at ≤640px / 15fps with a keyframe every ~0.5s, any seek decodes a handful of tiny
+// frames — effectively instant. Built in the background after a clip loads (the UI scrubs
+// the master until it's ready). Cached by path+size. Returns the proxy path, or null if
+// it couldn't be built (or was cancelled by a newer request via onStart/kill).
+async function makeScrubProxy(tools, inputPath, { onStart } = {}) {
+  const key = inputPath + ':' + fileBytes(inputPath);
+  const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 12);
+  const output = path.join(os.tmpdir(), `scscrub_${hash}.mp4`);
+  if (fileBytes(output) > 1000) return output; // already built
+
+  const info = await probe(tools.ffprobe, inputPath);
+  let w = info.w || 1280;
+  let h = info.h || 720;
+  const longSide = Math.max(w, h);
+  if (longSide > SCRUB_SIDE) {
+    const s = SCRUB_SIDE / longSide;
+    w = Math.round(w * s);
+    h = Math.round(h * s);
+  }
+  w = Math.max(2, w - (w % 2));
+  h = Math.max(2, h - (h % 2));
+
+  const enc = await pickVideoEncoder(tools);
+  const args = ['-y', '-v', 'error', '-i', inputPath, '-vf', `fps=${SCRUB_FPS},scale=${w}:${h}`, '-c:v', enc];
+  if (enc === 'libx264') args.push('-preset', 'ultrafast', '-crf', '28');
+  else args.push('-b:v', '1M');
+  args.push('-g', '8', '-pix_fmt', 'yuv420p', '-an', '-movflags', '+faststart', output);
+
+  const res = await runFFmpegProgress(tools.ffmpeg, args, 0, { onStart });
+  if (res.code === 0 && fileBytes(output) > 1000) return output;
+  try { fs.unlinkSync(output); } catch {} // a killed/failed encode must not poison the cache
+  return null;
+}
+
+module.exports = { makeProxy, makeScrubProxy, pickVideoEncoder };

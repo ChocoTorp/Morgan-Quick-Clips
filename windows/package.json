@@ -1,6 +1,6 @@
 {
   "name": "simpleclips",
-  "version": "0.1.0",
+  "version": "1.0.3",
   "description": "Turn screen recordings and videos into short, polished clips. Cross-platform (Windows + macOS).",
   "main": "src/main/index.js",
   "author": "Morgan",

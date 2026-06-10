@@ -7,7 +7,9 @@
 
 ```
 /                          shared spec + git
-  spec.md                  product intent (platform-agnostic)
+  spec.md                  product intent + architecture (platform-agnostic)
+  Patch notes.md           user-facing release notes (V1.01, V1.02, ...)
+  Downloadable builds/     shipped installers (exes git-ignored; versioned names)
   mac/                     macOS app — Swift/SwiftUI/AppKit (the ORIGINAL)
     implementation_Mac.md  how the macOS app is built
   windows/                 Windows app — Electron (the rebuild)
@@ -32,16 +34,18 @@ pure Node calling ffmpeg/ffprobe/whisper — no Electron deps, so it's unit-test
 windows/
   package.json            Electron + electron-builder config (build targets, icon, asarUnpack)
   src/
-    main/index.js         main process: window, permissions, IPC handlers, region overlay, rec:save
+    main/index.js         main process: window (hidden native titlebar + overlay buttons),
+                          permissions, IPC handlers (media:*, rec:save, region:*, shell:reveal,
+                          app:version), region overlay
     main/engine/          the media engine (pure Node, no Electron):
       tools.js            resolve bundled ffmpeg/ffprobe (ffmpeg-static) + whisper/model
       plan.js             format+quality -> ffmpeg -vf filtergraph + codec args (single source of truth)
       export.js           buildCropFilter, exportClip, exportWeb, hardEstimate, finishRecording
-      probe.js            ffprobe: dims, duration, fps (avg_frame_rate), subtitles
-      estimate.js         liveBytes size model (also mirrored in the renderer for instant updates)
+      probe.js            ffprobe: dims/duration/fps/subtitles + packetStats (per-second byte histogram)
+      estimate.js         liveBytes model + content-anchored estimator (mirrored in the renderer)
       ffmpeg.js           runTool + runFFmpegProgress (spawn, -progress parsing)
       captions.js         makeCaptions (ffmpeg extract wav -> whisper-cli -> srt/txt)
-      proxy.js            preview proxy for formats the player can't decode
+      proxy.js            preview proxy (non-native formats) + scrub proxy (drag-scrubbing)
       util.js             humanSize/mmss/extFor/uniqueOutputPath/etc.
     preload/index.js      contextBridge IPC for the main window
     preload/region.js     contextBridge IPC for the region overlay
@@ -60,27 +64,47 @@ windows/
 ```
 
 ### How recording works (the tricky part)
-The guiding principle: **the recorded file's frame rate is the display's refresh rate, as a
-CONSTANT rate.** One real number the editor (and the user) can trust and reduce from.
+The guiding principle: **capture is hardware-encoded H.264, so finishing a recording is a
+remux, not a re-encode** — Stop is near-instant, matching the Mac app (ScreenCaptureKit).
 1. Main reads the display's refresh via `screen.getAllDisplays()[i].displayFrequency` and
    returns it as `refreshRate` on each `screen:sources` entry and in `region:bounds`.
-2. Renderer `startRecording` picks the chosen display's `refreshRate` (clamped 24–240) as the
-   record rate, captures at it (`maxFrameRate`), and passes it to `saveRecording`.
+2. Renderer `startRecording` records at the display's refresh **clamped 24–120** (above
+   ~60fps at screen resolutions H.264 crosses Level 5.2, where Windows' built-in decoder
+   stops; 120 keeps high-refresh motion for deliberate high-fps exports without a 240fps
+   master's encode cost).
 3. Audio: system audio via Chromium desktop loopback (no driver), mic via a chosen device.
    Multiple sources are **mixed into one track via WebAudio** (MediaRecorder records only one
    audio track — adding a 2nd silently dropped the mic).
-4. `MediaRecorder` → webm (1s timeslice for reliable flushing).
-5. On stop, the webm + region rect + record rate go to main `rec:save`, which runs
-   `engine.finishRecording`: transcodes the **whole** stream to a clean seekable mp4 **at
-   constant `-r <rate>`** (`-fps_mode cfr`), cropping the region in the same pass.
-   - This fixes the MediaRecorder problems (no duration header → one-frame; variable-rate with
-     a bogus 1000 timebase) AND gives a real constant rate. Screen capture is inherently VFR
-     (frames only on change), so a 240Hz recording's *average* is meaningless (~28fps) — we
-     lock to the display rate instead. Static moments duplicate frames; x264 compresses those
-     to near-nothing. The editor then probes the file and reads the true rate (e.g. 240).
-   - Region crop maps logical→physical pixels via the display **scaleFactor**, so the recorded
-     resolution matches what the region overlay reported (matters on HiDPI/150%).
+4. `MediaRecorder` prefers **H.264 mp4** (`video/mp4;codecs=avc1...`, hardware-encoded via
+   Media Foundation; VP9/webm is the fallback), with an explicit bitrate (~0.05 bits/px/frame,
+   clamped 8–24 Mbps — the default ~2.5 Mbps looks awful at screen sizes). 1s timeslice for
+   reliable flushing.
+5. On stop, the capture + region rect + rate + wall-clock duration go to `rec:save` →
+   `engine.finishRecording`:
+   - **Fast path** (H.264, no crop): remux — `-c:v copy`, audio re-encoded to AAC, `+faststart`.
+     Writes a correct duration header (fixes MediaRecorder's no-duration "one frame" bug) in
+     well under a second regardless of length. The master keeps its real variable frame timing.
+   - **Slow path** (VP9 fallback, or region recordings that must crop): full transcode to CFR
+     h264 at the capture rate. Region crop maps logical→physical pixels via the display
+     **scaleFactor**, so the recorded resolution matches what the overlay reported (HiDPI).
+   - Progress streams to the status bar via `media:progress` (`id:'rec'`), with the renderer's
+     recording clock as the total (the raw capture's duration header is untrusted).
+   - On failure the raw capture is **kept** and returned (Chromium can still play it) — never
+     delete the only copy of a recording.
 6. Region overlay is excluded from capture with `setContentProtection(true)` (Win10 2004+).
+7. In the editor, the **fps slider defaults to min(source, 60)** (`load()`), so default
+   exports stay playable in stock Windows players; the slider still reaches the source rate.
+
+### Scrubbing (coalesced seeks + scrub proxy)
+- All seeks go through a **coalesced seeker** (one seek in flight per `<video>`; only the
+  latest target is kept) so fast drags don't queue stale seeks the picture then replays.
+- After load, `media:scrubProxy` builds a **scrub proxy** in the background
+  (`engine.makeScrubProxy`: ≤640px, 15fps, keyframe every ~0.5s (`-g 8`), no audio, hardware
+  encoder when available, cached by path+size in tmp). While dragging the playhead/trim
+  handles, a second stacked `<video>` shows the proxy (instant seeks); on release it hides
+  and the full-res master settles on the exact frame. Until the proxy is ready, drags scrub
+  the master. A newer clip's request kills an in-flight build; failed/killed builds delete
+  their partial file so the cache can't be poisoned.
 
 ### Region overlay (`renderer/region.{html,js}`)
 - Loaded as an **external** script — the window's CSP blocks inline scripts (this was the
@@ -92,15 +116,28 @@ CONSTANT rate.** One real number the editor (and the user) can trust and reduce 
   into a resize. Main applies it in `region:dragMove`.
 - Shows **physical** pixels (logical × devicePixelRatio) to match the recording.
 
-### Engine / estimate
+### Engine / estimate (three layers, all mirrored renderer-side for synchronous updates)
 - `plan()` is the single source of truth for encode settings (shared by export + estimate).
-- The live estimate is computed **synchronously in the renderer** (`liveBytes` mirrors
-  `engine/estimate.js`) so it updates instantly as sliders move — no IPC/debounce.
-- "Harder estimate" encodes a real sample via IPC for an exact figure, then **calibrates the
-  live model**: it stores `calib = measuredBytes / liveModelBytes` (per format) and the live
-  estimate multiplies by `calib` thereafter. So after one hard estimate the live number stays
-  anchored to reality and scales sensibly as sliders move, instead of snapping back to the
-  raw (often very wrong) model. Reset on load; recomputed per "Harder estimate".
+1. **Instant model** (`liveBytes`): pure-math bits-per-pixel × CRF curve. Only the first
+   ~0.3s fallback — a fixed content constant is off by 10-30x for screen recordings.
+2. **Content anchor** (`anchoredBytes`): after load, `media:packets` →
+   `probe.packetStats` reads every video packet's size (demux only, ~0.3s for 5 min) into a
+   per-second cumulative array. The estimate then scales the source's REAL bytes for the
+   trim range by 2^(ΔCRF/6) × pixelRatio^0.85 × fpsRatio^0.6 × codecFactor + audio. Trim
+   becomes content-aware (a static intro "costs" less than a busy section). GIF stays on
+   the model (palette-driven). srcCrf is assumed ~20.
+3. **Measured calibration** ("Harder estimate", auto-run ~300ms after load): encodes three
+   1.5s windows at 20/50/80% of the trim (one window for short trims) at the ACTUAL export
+   settings and extrapolates. Stored as `{calibBytes, calibParams}`; the displayed estimate
+   multiplies by `measured / base(calibParams)` recomputed on every read, so the correction
+   stays consistent even when the base improves underneath (e.g. the anchor arriving after
+   the measurement). Per-format; reset on load.
+- The estimate sub-line shows which layer is live: `rough` → `live` → `calibrated`
+  (each segment is an unbreakable span so the line wraps only at the `·` separators).
+- Export correctness: `exportClip`/`exportWeb` require ffmpeg **exit code 0** and delete
+  partial output on failure — a broken file is never left where a "Saved" one should be.
+- On success the status shows `Saved to <path>` + a **Show in folder** button
+  (`shell:reveal` → `shell.showItemInFolder`).
 
 ### Bundling & packaging
 - ffmpeg/ffprobe: `ffmpeg-static` + `ffprobe-static`, `asarUnpack`ed, resolved with an
@@ -169,11 +206,16 @@ npm run dist:win                       # output -> windows/dist/
 Both bundle ffmpeg/ffprobe (asar-unpacked), `whisper-cli` + DLLs, and the captions model,
 so they run fully offline.
 
-**Where shipped builds live.** Copy the artifact(s) from `windows/dist/` into
-`downloadable builds/Windows/` (the portable exe is renamed `SimpleClips-<ver>-portable.exe`
-for clarity). That folder's `README.md` is tracked, but the binaries are git-ignored
-(`downloadable builds/**/*.exe`, `.dmg`, `.zip`) because they exceed GitHub's 100 MB file
-limit. **Distribute via GitHub Releases**, not the repo.
+**Versioning + patch notes (the release ritual).** Versions iterate **V1.01, V1.02, ...**
+in `Patch notes.md` at the repo root. For each release: bump `windows/package.json` to the
+matching semver `1.0.x` BEFORE building (the title bar reads it at runtime via
+`app:version`, displayed as `V 1.0x`), build, then copy the artifacts into
+`Downloadable builds/Windows/` named with the patch version —
+`SimpleClips Setup 1.0x.exe` and `SimpleClips-1.0x-portable.exe` — replacing the previous
+pair, and add a simple, readable entry to `Patch notes.md` covering all changes. The
+binaries are git-ignored (they exceed GitHub's 100 MB limit); **distribute via GitHub
+Releases**, not the repo. (Watch for the portable exe being locked by a running instance —
+close SimpleClips first.)
 
 **Unsigned.** With no code-signing cert, first run shows a SmartScreen "unknown publisher"
 prompt (More info, then Run anyway). See the `winCodeSign` gotcha above.

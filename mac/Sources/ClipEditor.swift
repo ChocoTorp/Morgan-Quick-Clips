@@ -66,6 +66,24 @@ func runTool(_ exe: String, _ args: [String], env: [String: String] = [:]) -> St
     return String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 }
 
+// Like runTool, but also reports whether the tool exited cleanly and can hand the
+// Process back via onStart (so a newer request can terminate a stale run).
+@discardableResult
+func runToolChecked(_ exe: String, _ args: [String], onStart: ((Process) -> Void)? = nil) -> (output: String, ok: Bool) {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return ("", false) }
+    onStart?(p)
+    let d = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    let out = String(data: d, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return (out, p.terminationStatus == 0)
+}
+
 // Split a plan() codec string ("-c:v libx264 -crf 18 …") into argv tokens.
 func args(_ s: String) -> [String] { s.split(separator: " ").map(String.init) }
 
@@ -80,17 +98,19 @@ func lastOutTime(_ s: String) -> Double? {
 }
 
 // Run ffmpeg while streaming `-progress pipe:1`, reporting 0…1 as it encodes.
-// Returns the merged output (for error reporting), like runTool. `onStart` hands back
-// the Process so the caller can terminate it (Cancel).
+// Returns the merged output (for error reporting) AND the exit code — success is
+// code == 0, not "a file exists": ffmpeg leaves a partial file behind when it dies
+// mid-encode, which must never be reported as "Saved". `onStart` hands back the
+// Process so the caller can terminate it (Cancel).
 func runFFmpegProgress(_ args: [String], total: Double, onStart: ((Process) -> Void)? = nil,
-                       onProgress: @escaping (Double) -> Void) -> String {
+                       onProgress: @escaping (Double) -> Void) -> (output: String, code: Int32) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: gFFmpeg)
     p.arguments = args
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = pipe
-    do { try p.run() } catch { return "" }
+    do { try p.run() } catch { return ("", -1) }
     onStart?(p)
     let h = pipe.fileHandleForReading
     var collected = ""
@@ -101,7 +121,7 @@ func runFFmpegProgress(_ args: [String], total: Double, onStart: ((Process) -> V
         }
     }
     p.waitUntilExit()
-    return collected.trimmingCharacters(in: .whitespacesAndNewlines)
+    return (collected.trimmingCharacters(in: .whitespacesAndNewlines), p.terminationStatus)
 }
 
 // "~12s left" / "~1m 05s left" for an ETA in seconds.
@@ -136,8 +156,14 @@ func fileBytes(_ path: String) -> Double {
 // so the estimate reflects exactly what export will do.
 // format: "MP4" | "GIF" | "WEBM".  q: continuous fidelity→optimization, 0...1
 //   (0 = maximum fidelity, 1 = maximum optimization; the slider drives this).
+// fast: trade encoder effort for wall-clock — x264 veryfast for the H.264 family,
+//   VP9 cpu-used 5 for WebM. Measured on real 4K screen content: ~2× faster than the
+//   default ladder for under one VMAF point. (A VideoToolbox hardware mode was tried
+//   and removed: on Apple Silicon the media engine is pixel-bound to ~100fps at 4K —
+//   multi-core x264 matches it on speed and beats it badly on quality-per-byte.)
+//   Ignored for GIF/MPEG-2/WMV, where effort barely moves the needle.
 // Returns the -vf filtergraph and the trailing codec args.
-func plan(_ format: String, _ q: Double, _ crop: String, _ fps: Int?) -> (vf: String, codec: String) {
+func plan(_ format: String, _ q: Double, _ crop: String, _ fps: Int?, _ fast: Bool = false) -> (vf: String, codec: String) {
     let rate = (fps != nil) ? " -r \(fps!)" : ""
     let qq = min(max(q, 0), 1)
     switch format {
@@ -155,7 +181,8 @@ func plan(_ format: String, _ q: Double, _ crop: String, _ fps: Int?) -> (vf: St
     case "WEBM":
         let crf = Int((18 + qq * 22).rounded())          // 18 → 40
         let ab  = Int((192 - qq * 96).rounded())         // 192 → 96 kbps
-        let extra = qq > 0.67 ? "-row-mt 1 -deadline good -cpu-used 3" : "-row-mt 1"
+        let extra = fast ? "-row-mt 1 -deadline good -cpu-used 5"
+                  : (qq > 0.67 ? "-row-mt 1 -deadline good -cpu-used 3" : "-row-mt 1")
         return (crop, "-c:v libvpx-vp9 -crf \(crf) -b:v 0 \(extra) -pix_fmt yuv420p\(rate) -c:a libopus -b:a \(ab)k")
     case "MPG":   // MPEG-1/2 program stream
         let qv = Int((2 + qq * 5).rounded())             // 2 → 7
@@ -165,12 +192,18 @@ func plan(_ format: String, _ q: Double, _ crop: String, _ fps: Int?) -> (vf: St
         return (crop, "-c:v wmv2 -q:v \(qv)\(rate) -c:a wmav2 -b:a 192k")
     default:      // H.264/AAC family of containers: MP4, MOV, M4V, MKV, AVI, TS, FLV, F4V, 3GP
         let crf = Int((14 + qq * 16).rounded())          // 14 → 30
-        let preset = qq < 0.34 ? "slow" : (qq < 0.67 ? "medium" : "slower")
+        let preset = fast ? "veryfast" : (qq < 0.34 ? "slow" : (qq < 0.67 ? "medium" : "slower"))
         let ab  = Int((256 - qq * 160).rounded())        // 256 → 96 kbps
         let profile = (format == "3GP") ? " -profile:v baseline -level 3.1" : ""
-        let fast = ["MP4","MOV","M4V"].contains(format) ? " -movflags +faststart" : ""
-        return (crop, "-c:v libx264 -crf \(crf) -preset \(preset)\(profile) -pix_fmt yuv420p\(rate) -c:a aac -b:a \(ab)k\(fast)")
+        let faststart = ["MP4","MOV","M4V"].contains(format) ? " -movflags +faststart" : ""
+        return (crop, "-c:v libx264 -crf \(crf) -preset \(preset)\(profile) -pix_fmt yuv420p\(rate) -c:a aac -b:a \(ab)k\(faststart)")
     }
+}
+
+// Formats where the Fast-export toggle changes anything. GIF (palette passes) and the
+// ancient MPEG-2/WMV encoders are already effort-insensitive.
+func fastApplies(_ format: String) -> Bool {
+    !["GIF", "MPG", "WMV"].contains(format)
 }
 
 // A short human label for a fidelity→optimization slider value (0...1).
@@ -194,6 +227,146 @@ func extFor(_ format: String) -> String {
     }
 }
 
+// ---- size estimation model (mirrors the Windows engine's estimate.js) -----
+
+// Every setting that affects output size, snapshotted so a calibration taken at one
+// set of settings can be re-evaluated against the model later.
+struct EstParams {
+    var outFormat: String
+    var quality: Double
+    var outW: Int
+    var outH: Int
+    var srcFps: Double
+    var fpsOverride: Int?      // nil = keep source rate
+    var trimStart: Double
+    var trimEnd: Double
+    var capBurn: Bool
+    // Fast export (x264 veryfast / VP9 cpu-used 5). The size model treats it as
+    // size-neutral (measured within ±10% on real content, either direction), but it
+    // lives in the params so a calibration taken in one mode is re-measured for the
+    // other (the toggle triggers an auto-measure).
+    var fast: Bool
+}
+
+// Content anchor: the source's own per-second video bytes. cum[i] = total video bytes
+// before second i, so any trim range is an O(1) lookup.
+struct Anchor {
+    var cum: [Double]
+    var total: Double
+    var srcW: Double
+    var srcH: Double
+    var srcCrf: Double        // ~CRF 20 is typical delivered H.264 (incl. our masters)
+}
+
+// Parse ffprobe "-show_entries packet=pts_time,size -of csv=p=0" output (video stream
+// only) into 1-second byte buckets. Packets with no usable timestamp fall into the
+// last seen bucket.
+func parsePackets(_ csv: String) -> (cum: [Double], total: Double) {
+    var buckets: [Double] = []
+    var total = 0.0
+    var lastSec = 0
+    for line in csv.split(separator: "\n") {
+        guard let c = line.firstIndex(of: ",") else { continue }
+        let t = Double(line[..<c])
+        let sizeStr = line[line.index(after: c)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let size = Double(sizeStr), size > 0 else { continue }
+        let sec = (t != nil && t!.isFinite && t! >= 0) ? Int(t!) : lastSec
+        lastSec = sec
+        while buckets.count <= sec { buckets.append(0) }
+        buckets[sec] += size
+        total += size
+    }
+    var cum: [Double] = [0]
+    for b in buckets { cum.append(cum.last! + b) }
+    return (cum, total)
+}
+
+// Instant, no-encode size model. Rough by design: scales a per-pixel-per-frame
+// bitrate by the CRF curve (~6 CRF ≈ half the size).
+func liveBytes(_ fmt: String, _ p: EstParams) -> Double {
+    let dur = max(0.05, p.trimEnd - p.trimStart)
+    let px = Double(max(2, p.outW)) * Double(max(2, p.outH))
+    let src = p.srcFps > 0 ? p.srcFps : 30
+    let fps = Double(p.fpsOverride ?? Int(src.rounded()))
+    let q = min(max(p.quality, 0), 1)
+    switch fmt {
+    case "GIF":
+        let gfps = 20 - q * 8
+        let bpp = 0.5 - q * 0.3                       // bytes per pixel-frame (palettized)
+        return px * gfps * dur * bpp
+    case "WEBM":
+        let crf = 18 + q * 22
+        let bpp = 0.05 * pow(2.0, (31 - crf) / 6)
+        let abits = (192 - q * 96) * 1000 * dur
+        return (bpp * px * fps * dur + abits) / 8
+    case "Web":
+        return liveBytes("WEBM", p) + liveBytes("GIF", p)
+    case "MPG", "WMV":
+        let crf = 14 + q * 16
+        let bpp = 0.08 * pow(2.0, (22 - crf) / 6) * 2.2   // older codecs ≈ 2× larger
+        return (bpp * px * fps * dur + 192 * 1000 * dur) / 8
+    default:                                          // H.264 family
+        let crf = 14 + q * 16
+        let bpp = 0.08 * pow(2.0, (22 - crf) / 6)
+        let abits = (256 - q * 160) * 1000 * dur
+        return (bpp * px * fps * dur + abits) / 8
+    }
+}
+
+// Content-anchored estimate: scale the source's REAL bytes for the trimmed range by
+// quality (the same ~6-CRF-halves-size rule), pixel ratio (sublinear: downscaled
+// content keeps more detail per pixel), fps ratio (sublinear: duplicate and
+// near-static frames are nearly free), and a codec factor. Returns nil when it can't
+// apply (no anchor data, or GIF whose size is palette- not CRF-driven) — the caller
+// falls back to liveBytes. No fixed constant can model both a static screen recording
+// and camera footage (they differ by 10-30x); the clip itself is the best predictor.
+func anchoredBytes(_ fmt: String, _ p: EstParams, _ anchor: Anchor?) -> Double? {
+    guard let a = anchor, a.cum.count >= 2, a.total > 0 else { return nil }
+    if fmt == "GIF" { return nil }
+    if fmt == "Web" {
+        guard let w = anchoredBytes("WEBM", p, a) else { return nil }
+        return w + liveBytes("GIF", p)
+    }
+    let cum = a.cum
+    let maxI = cum.count - 1
+    func at(_ t: Double) -> Double {                  // linear interp inside buckets
+        let x = clamp(t, 0, Double(maxI))
+        let i = Int(x)
+        return i >= maxI ? cum[maxI] : cum[i] + (cum[i + 1] - cum[i]) * (x - Double(i))
+    }
+    let srcBytes = max(0, at(p.trimEnd) - at(p.trimStart))
+    guard srcBytes > 0 else { return nil }
+    let dur = max(0.05, p.trimEnd - p.trimStart)
+    let q = min(max(p.quality, 0), 1)
+    let srcPx = max(2, a.srcW) * max(2, a.srcH)
+    let outPx = Double(max(2, p.outW)) * Double(max(2, p.outH))
+    let srcFps = p.srcFps > 0 ? p.srcFps : 30
+    let fps = Double(p.fpsOverride ?? Int(srcFps.rounded()))
+    // One H.264-equivalent quality curve for every codec (matches plan()'s h264 family);
+    // VP9/MPEG-2/WMV efficiency differences are folded into a flat codec factor instead.
+    let outCrf = 14 + q * 16
+    let codecF = fmt == "WEBM" ? 0.7 : ((fmt == "MPG" || fmt == "WMV") ? 2.2 : 1.0)
+    let video = srcBytes
+        * pow(2, (a.srcCrf - outCrf) / 6)
+        * pow(outPx / srcPx, 0.85)
+        * pow(fps / srcFps, 0.6)
+        * codecF
+    let akbps = fmt == "WEBM" ? 192 - q * 96 : ((fmt == "MPG" || fmt == "WMV") ? 192 : 256 - q * 160)
+    return video + akbps * 1000 * dur / 8
+}
+
+// Best available base estimate: content-anchored once packet data is in, model until then.
+func estBase(_ fmt: String, _ p: EstParams, _ anchor: Anchor?) -> Double {
+    anchoredBytes(fmt, p, anchor) ?? liveBytes(fmt, p)
+}
+
+
+// Rough size of an embedded soft-subtitle track (mov_text), MP4 family only. Text, so small.
+func captionBytes(_ p: EstParams) -> Double {
+    guard p.capBurn, ["MP4", "MOV", "M4V"].contains(p.outFormat) else { return 0 }
+    return max(0.05, p.trimEnd - p.trimStart) * 30   // ≈ 30 bytes/sec of dialogue
+}
+
 // Private temp folder holding copies of imported clips, so the queue survives
 // the originals being moved/deleted. Wiped on quit (see AppDelegate).
 let gStashDir = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -211,7 +384,8 @@ final class ScreenRecorder: NSObject, SCStreamDelegate, SCRecordingOutputDelegat
 
     // displayID/sourceRect/pixel size are computed by the caller (region mapping).
     func start(displayID: CGDirectDisplayID?, sourceRect: CGRect?,
-               pixelW: Int, pixelH: Int, micOn: Bool, sysAudio: Bool, cursor: Bool) async throws {
+               pixelW: Int, pixelH: Int, micOn: Bool, micDeviceID: String,
+               sysAudio: Bool, cursor: Bool) async throws {
         let content = try await SCShareableContent.current
         guard let display = (displayID != nil
                 ? content.displays.first { $0.displayID == displayID }
@@ -226,13 +400,15 @@ final class ScreenRecorder: NSObject, SCStreamDelegate, SCRecordingOutputDelegat
         config.height = max(2, pixelH - pixelH % 2)
         if let r = sourceRect { config.sourceRect = r }
         // Cap capture at the display's real refresh rate (120 on ProMotion, 60
-        // otherwise) instead of a hard 30. ScreenCaptureKit is variable-rate, so
-        // this is a ceiling — frames are only emitted when the screen changes.
-        let screenFps = Self.displayMaxFPS(display.displayID)
+        // otherwise) instead of a hard 30, clamped to 120 like the Windows build —
+        // a 240Hz master gains nothing but encode time. ScreenCaptureKit is
+        // variable-rate, so this is a ceiling — frames only come when the screen changes.
+        let screenFps = min(120, Self.displayMaxFPS(display.displayID))
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(screenFps))
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.showsCursor = cursor
         config.captureMicrophone = micOn
+        if micOn, !micDeviceID.isEmpty { config.microphoneCaptureDeviceID = micDeviceID }
         config.capturesAudio = sysAudio        // system/screen audio
 
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -293,6 +469,35 @@ final class ScreenRecorder: NSObject, SCStreamDelegate, SCRecordingOutputDelegat
     }
 }
 
+// ---- coalesced seeking -----------------------------------------------------
+
+// At most ONE seek in flight per player; while the decoder works, only the LATEST
+// requested time is kept. Without this, a fast drag queues stale seeks and the
+// picture replays the drag in slow motion long after the mouse stopped.
+final class CoalescedSeeker {
+    private let player: AVPlayer
+    private var busy = false
+    private var pending: Double? = nil
+    init(_ p: AVPlayer) { player = p }
+
+    func to(_ t: Double) {                 // main thread only
+        if busy { pending = t; return }
+        busy = true
+        step(t)
+    }
+    private func step(_ t: Double) {
+        let cm = CMTime(seconds: max(0, t), preferredTimescale: 600)
+        player.seek(to: cm, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let next = self.pending { self.pending = nil; self.step(next) }
+                else { self.busy = false }
+            }
+        }
+    }
+    func reset() { busy = false; pending = nil }   // item changed → in-flight seek never lands
+}
+
 // ---- state ---------------------------------------------------------------
 
 final class EditorState: ObservableObject {
@@ -318,12 +523,23 @@ final class EditorState: ObservableObject {
     var exportProcess: Process?                 // the running ffmpeg, so Cancel can stop it
     var exportCancelled = false
     @Published var estimating = false           // a "Harder estimate" sample encode is running
-    @Published var hardBytes: Double? = nil      // measured estimate (sample-encoded) for current settings
-    @Published var hardSig = ""                  // settings signature the measured estimate was taken at
+    // Content anchor: the source's own per-second video bytes, fetched once per clip.
+    // Makes the live estimate content-aware from load.
+    @Published var anchor: Anchor? = nil
+    // Calibration from a "Harder estimate": the measured bytes and the settings they were
+    // measured at. The correction factor is recomputed as measured/model on every read, so
+    // it stays consistent even if the model improves later (e.g. the anchor arriving).
+    @Published var calibBytes: Double = 0
+    @Published var calibFormat = ""
+    var calibParams: EstParams? = nil
+    var autoEstWork: DispatchWorkItem?           // debounced auto-measure after load
+    // "Show in folder" target — only the status that saved something offers it.
+    @Published var revealURL: URL? = nil
     @Published var status = "Drop video, .gif, or multiple files here."
     @Published var statusKind = "info"   // info | work | ok | err
     @Published var outFormat = "MP4"   // set to the detected input type on load
     @Published var quality: Double = 0.5  // 0 = max fidelity … 1 = max optimization (slider)
+    @Published var fastExport = false  // x264 veryfast / VP9 cpu-used 5: ~2× faster encode
     @Published var outName = ""
     // Output pixel size (aspect-locked to the crop). Defaults to the crop size.
     @Published var outW: Int = 0
@@ -345,6 +561,8 @@ final class EditorState: ObservableObject {
     @Published var screens: [(id: CGDirectDisplayID, name: String)] = []
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var micOn = false
+    @Published var micDevices: [(id: String, name: String)] = []
+    @Published var micDeviceID = ""        // empty = system default microphone
     @Published var sysAudioOn = false
     @Published var cursorOn = true
     @Published var regionOn = false
@@ -354,11 +572,34 @@ final class EditorState: ObservableObject {
     var recTimer: Timer?
     var recStart: Date?
 
-    func setStatus(_ msg: String, _ kind: String = "info") { status = msg; statusKind = kind }
+    // Any new status retires a stale "Show in folder" offer.
+    func setStatus(_ msg: String, _ kind: String = "info") { status = msg; statusKind = kind; revealURL = nil }
 
     let player = AVPlayer()
     var previewURL: URL?
     var timeObserver: Any?
+
+    // Scrub proxy (tiny, densely-keyframed mp4): shown ONLY while the user drags the
+    // playhead or trim handles, so scrubbing is instant even on a heavy master.
+    let scrubPlayer = AVPlayer()
+    @Published var scrubReady = false      // proxy built and loaded into scrubPlayer
+    @Published var scrubbing = false       // a timeline drag is in progress
+    var scrubURL: URL?
+    var scrubBuild: Process?               // running proxy encode (killed on new load)
+    lazy var mainSeeker = CoalescedSeeker(player)
+    lazy var scrubSeeker = CoalescedSeeker(scrubPlayer)
+
+    func beginScrub() { scrubbing = true }
+    // While dragging, seek the low-res proxy instead of the full-res master; before
+    // the proxy is ready, the coalesced seeker alone already keeps the master honest.
+    func scrubTo(_ t: Double) {
+        current = t
+        if scrubReady { scrubSeeker.to(t) } else { mainSeeker.to(t) }
+    }
+    func endScrub() {
+        scrubbing = false
+        mainSeeker.to(current)             // full-quality frame exactly where the drag ended
+    }
 
     func resetCropFull() { cropX = 0; cropY = 0; cropW = srcW; cropH = srcH; syncOutToCrop() }
     // Output size follows the crop (even dims). Called whenever the crop changes.
@@ -371,7 +612,7 @@ final class EditorState: ObservableObject {
         if let o = timeObserver { player.removeTimeObserver(o); timeObserver = nil }
         let t = CMTime(seconds: 0.03, preferredTimescale: 600)
         timeObserver = player.addPeriodicTimeObserver(forInterval: t, queue: .main) { [weak self] tm in
-            guard let self = self else { return }
+            guard let self = self, !self.scrubbing else { return }   // the drag owns `current`
             self.current = tm.seconds
             // Loop within the trim region while playing.
             if self.playing, self.trimEnd > self.trimStart, tm.seconds >= self.trimEnd - 0.02 {
@@ -717,18 +958,22 @@ struct Timeline: View {
                 // playhead
                 Rectangle().fill(Color.primary.opacity(0.8)).frame(width: 2).offset(x: xCur - 1)
                 // trim handles — wide grab area, accent-colored, with direction arrows.
+                // Drags scrub via the low-res proxy (instant), then endScrub() snaps the
+                // master to the exact final frame.
                 handle(.right)                                  // start: ▶ points into the clip
                     .offset(x: xStart - hitW / 2)
                     .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
+                        if !s.scrubbing { s.beginScrub() }
                         let t = clamp(Double((g.location.x - inset) / W) * dur, 0, s.trimEnd - 0.1)
-                        s.trimStart = t; s.seek(t)
-                    })
+                        s.trimStart = t; s.scrubTo(t)
+                    }.onEnded { _ in s.endScrub() })
                 handle(.left)                                   // end: ◀ points into the clip
                     .offset(x: xEnd - hitW / 2)
                     .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("tl")).onChanged { g in
+                        if !s.scrubbing { s.beginScrub() }
                         let t = clamp(Double((g.location.x - inset) / W) * dur, s.trimStart + 0.1, s.duration)
-                        s.trimEnd = t; s.seek(t)
-                    })
+                        s.trimEnd = t; s.scrubTo(t)
+                    }.onEnded { _ in s.endScrub() })
             }
             .frame(height: barH)
             .coordinateSpace(name: "tl")
@@ -737,9 +982,10 @@ struct Timeline: View {
                 // scrub playhead when dragging on the bar background (away from handles)
                 let t = clamp(Double((g.location.x - inset) / W) * dur, 0, s.duration)
                 if abs(g.location.x - xStart) > hitW / 2 && abs(g.location.x - xEnd) > hitW / 2 {
-                    s.seek(t)
+                    if !s.scrubbing { s.beginScrub() }
+                    s.scrubTo(t)
                 }
-            })
+            }.onEnded { _ in if s.scrubbing { s.endScrub() } })
         }
         .frame(height: barH)
     }
@@ -833,6 +1079,13 @@ struct ContentView: View {
                         }
                         Divider().frame(height: 16)
                         Toggle("Mic", isOn: $s.micOn).toggleStyle(.checkbox)
+                            .onChange(of: s.micOn) { on in if on { enumerateMics() } }
+                        // Pick which microphone (matches the Windows build).
+                        if s.micOn && !s.micDevices.isEmpty {
+                            Picker("", selection: $s.micDeviceID) {
+                                ForEach(s.micDevices, id: \.id) { d in Text(d.name).tag(d.id) }
+                            }.labelsHidden().frame(maxWidth: 150)
+                        }
                         Toggle("Screen audio", isOn: $s.sysAudioOn).toggleStyle(.checkbox)
                         Toggle("Cursor", isOn: $s.cursorOn).toggleStyle(.checkbox)
                         Spacer()
@@ -861,6 +1114,11 @@ struct ContentView: View {
                     ZStack {
                         Color.black
                         PlayerView(player: s.player)
+                        // The scrub proxy sits on top, visible only mid-drag; the master
+                        // underneath settles on the exact frame when the drag ends.
+                        PlayerView(player: s.scrubPlayer)
+                            .opacity(s.scrubbing && s.scrubReady ? 1 : 0)
+                            .allowsHitTesting(false)
                         if s.srcW > 0 && s.cropOn { CropOverlay(container: geo.size).environmentObject(s) }
                         if s.inputURL == nil {
                             VStack(spacing: 8) {
@@ -1029,8 +1287,18 @@ struct ContentView: View {
                             .onAppear { sliderColH = g.size.height }
                             .onChange(of: g.size.height) { h in sliderColH = h }
                     })
+                    // Export speed choice (vertical, between the sliders and the
+                    // estimate). For GIF/MPG/WMV — where encoder effort changes nothing —
+                    // the Fast option alone grays out and Best compression shows
+                    // selected; the preference returns with an effort-sensitive format.
+                    Divider().frame(height: sliderColH > 0 ? sliderColH : nil)
+                    VStack(alignment: .leading, spacing: 8) {
+                        speedOption(true, "Fast export", "about twice as fast")
+                        speedOption(false, "Best compression", "slower, smallest file")
+                    }
+                    .frame(height: sliderColH > 0 ? sliderColH : nil, alignment: .center)
                     // Estimate card: locked to the height of the three sliders.
-                    liveReadout.frame(width: 200, height: sliderColH > 0 ? sliderColH : nil)
+                    liveReadout.frame(width: 230, height: sliderColH > 0 ? sliderColH : nil)
                 }
                 .sectionCard()
             }
@@ -1058,70 +1326,74 @@ struct ContentView: View {
 
     func evenInt(_ v: CGFloat) -> Int { let i = Int(v.rounded()); return max(2, i - i % 2) }
 
-    // Instant, no-encode size model for the live readout. Rough by design: scales a
-    // per-pixel-per-frame bitrate by the CRF curve (~6 CRF ≈ half the size).
-    func liveBytes(_ fmt: String) -> Double {
-        let dur = max(0.05, s.trimEnd - s.trimStart)
-        let px = Double(max(2, s.outW)) * Double(max(2, s.outH))
-        let src = s.srcFps > 0 ? s.srcFps : 30
-        let fps = Double(fpsOverride() ?? Int(src.rounded()))
-        let q = min(max(s.quality, 0), 1)
-        switch fmt {
-        case "GIF":
-            let gfps = 20 - q * 8
-            let bpp = 0.5 - q * 0.3                       // bytes per pixel-frame (palettized)
-            return px * gfps * dur * bpp
-        case "WEBM":
-            let crf = 18 + q * 22
-            let bpp = 0.05 * pow(2.0, (31 - crf) / 6)
-            let abits = (192 - q * 96) * 1000 * dur
-            return (bpp * px * fps * dur + abits) / 8
-        case "Web":
-            return liveBytes("WEBM") + liveBytes("GIF")
-        case "MPG", "WMV":
-            let crf = 14 + q * 16
-            let bpp = 0.08 * pow(2.0, (22 - crf) / 6) * 2.2   // older codecs ≈ 2× larger
-            return (bpp * px * fps * dur + 192 * 1000 * dur) / 8
-        default:                                          // H.264 family
-            let crf = 14 + q * 16
-            let bpp = 0.08 * pow(2.0, (22 - crf) / 6)
-            let abits = (256 - q * 160) * 1000 * dur
-            return (bpp * px * fps * dur + abits) / 8
+    // One export-speed radio row. The selection shown is the EFFECTIVE mode (Best
+    // compression whenever the format ignores encoder effort), not the raw preference.
+    func speedOption(_ fast: Bool, _ title: String, _ sub: String) -> some View {
+        let enabled = !fast || fastApplies(s.outFormat)
+        let selected = (s.fastExport && fastApplies(s.outFormat)) == fast
+        return Button(action: {
+            let before = s.fastExport && fastApplies(s.outFormat)
+            s.fastExport = fast
+            // A calibration measured in the other mode is only a model-transferred
+            // guess for this one — re-measure so the number snaps to reality.
+            if before != (fast && fastApplies(s.outFormat)) { scheduleAutoEstimate() }
+        }) {
+            HStack(alignment: .top, spacing: 5) {
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 12))
+                    .foregroundColor(selected ? .accentColor : .secondary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.system(size: 11))
+                    Text(sub).font(.system(size: 10)).foregroundColor(.secondary)
+                }
+            }
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .disabled(s.exporting || !enabled)
+        .opacity(enabled ? 1 : 0.4)
+        .help(fast
+              ? (enabled ? "Encode with less effort (x264 veryfast) — about twice as fast, with a barely measurable quality difference. Size can land a little above or below Best compression."
+                         : "\(s.outFormat) encodes the same way regardless of effort, so fast mode doesn't apply.")
+              : "Spend full encoder effort for the smallest file at the chosen quality.")
     }
 
-    // Rough size of an embedded soft-subtitle track (mov_text). Only when "Embed
-    // subs" is on and the container can carry it (mp4 family). Text-only, so small.
-    func captionBytes() -> Double {
-        guard s.capBurn, ["MP4","MOV","M4V"].contains(s.outFormat) else { return 0 }
-        let dur = max(0.05, s.trimEnd - s.trimStart)
-        return dur * 30   // ≈ 30 bytes/sec of dialogue
+    // Snapshot of every size-affecting setting (feeds the model + calibration).
+    func estParams() -> EstParams {
+        EstParams(outFormat: s.outFormat, quality: s.quality, outW: s.outW, outH: s.outH,
+                  srcFps: s.srcFps, fpsOverride: fpsOverride(),
+                  trimStart: s.trimStart, trimEnd: s.trimEnd, capBurn: s.capBurn,
+                  fast: s.fastExport && fastApplies(s.outFormat))   // effective, not the raw preference
     }
 
-    // A fingerprint of every setting that affects output size; the measured
-    // ("Harder estimate") result is only shown while it still matches.
-    var estSig: String {
-        "\(s.outFormat)|\(Int(s.quality * 100))|\(fpsOverride() ?? -1)|\(s.outW)x\(s.outH)|"
-        + "\(Int(s.trimStart * 10))-\(Int(s.trimEnd * 10))|\(s.capBurn)"
-    }
-    var isMeasured: Bool { s.hardBytes != nil && s.hardSig == estSig }
-    // Bytes to display: measured if fresh, else the instant live model. Captions added on top.
-    var shownBytes: Double {
-        (isMeasured ? s.hardBytes! : liveBytes(s.outFormat)) + captionBytes()
+    // Displayed estimate: best base (anchored when packet data is in, model until then),
+    // corrected by the measured/model ratio AT THE MEASURED SETTINGS so the number stays
+    // locked onto the last real measurement and extrapolates sensibly as sliders move.
+    func shownEstimate() -> (bytes: Double, calibrated: Bool) {
+        let p = estParams()
+        var base = estBase(s.outFormat, p, s.anchor)
+        var calibrated = false
+        if s.calibBytes > 0, s.calibFormat == s.outFormat, let cp = s.calibParams {
+            let m = estBase(s.outFormat, cp, s.anchor)
+            if m > 0 { base *= s.calibBytes / m; calibrated = true }
+        }
+        return (base + captionBytes(p), calibrated)
     }
 
     // Compact estimate card — sits to the right of the three sliders, height-locked
     // to them. Two text lines + the Harder-estimate button so it never grows taller.
     @ViewBuilder var liveReadout: some View {
         if let input = s.inputURL {
-            let est = shownBytes
+            let est = shownEstimate()
             let orig = fileBytes(input.path)
-            let savings = orig > 0 ? (1 - est / orig) * 100 : 0
+            let savings = orig > 0 ? (1 - est.bytes / orig) * 100 : 0
+            let layer = s.estimating ? "measuring…"
+                : (est.calibrated ? "calibrated" : (s.anchor != nil ? "live" : "rough"))
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
-                    Image(systemName: isMeasured ? "checkmark.seal.fill" : "wand.and.stars")
+                    Image(systemName: est.calibrated ? "checkmark.seal.fill" : "wand.and.stars")
                         .font(.system(size: 11)).foregroundColor(.accentColor)
-                    Text("≈ \(humanSize(est))").font(.system(size: 13, weight: .semibold))
+                    Text("≈ \(humanSize(est.bytes))").font(.system(size: 13, weight: .semibold))
                     Text(s.outFormat).font(.system(size: 10)).foregroundColor(.secondary)
                     if orig > 0 {
                         Text(savings >= 0 ? "−\(Int(savings.rounded()))%" : "+\(Int((-savings).rounded()))%")
@@ -1129,13 +1401,13 @@ struct ContentView: View {
                             .foregroundColor(savings >= 0 ? .green : .orange)
                     }
                 }
-                Text("\(orig > 0 ? "was \(humanSize(orig)) · " : "")\(qLabel(s.quality)) · \(isMeasured ? "measured" : "live")")
+                Text("\(orig > 0 ? "was \(humanSize(orig)) · " : "")\(qLabel(s.quality)) · \(layer)")
                     .font(.system(size: 10)).foregroundColor(.secondary).lineLimit(1)
                 Spacer(minLength: 2)
-                Button(s.estimating ? "Estimating…" : "Harder estimate") { hardEstimate() }
+                Button(s.estimating ? "Measuring…" : "Harder estimate") { hardEstimate() }
                     .font(.system(size: 11)).frame(maxWidth: .infinity)
                     .disabled(s.exporting || s.estimating)
-                    .help("Encode a short real sample for a more accurate number, then update the figures above.")
+                    .help("Encode short real samples for a more accurate number, then keep the live estimate calibrated to them.")
             }
             .padding(8)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -1245,6 +1517,11 @@ struct ContentView: View {
                 .font(.system(size: 11))
                 .foregroundColor(s.statusKind == "ok" ? .green : (s.statusKind == "err" ? .red : .secondary))
                 .lineLimit(2)
+            // Only the status that just saved something offers this (cleared by the next status).
+            if let r = s.revealURL, !s.exporting {
+                Button("Show in folder") { NSWorkspace.shared.activateFileViewerSelecting([r]) }
+                    .font(.system(size: 11))
+            }
             if determinate {
                 ProgressView(value: s.exportProgress).frame(width: 150)
                 Text("\(Int(s.exportProgress * 100))%\(s.exportETA.isEmpty ? "" : "  \(s.exportETA)")")
@@ -1337,6 +1614,10 @@ struct ContentView: View {
         s.queue.remove(at: min(s.queueIndex, s.queue.count - 1))
         if s.queue.isEmpty {
             s.inputURL = nil; s.srcW = 0; s.player.replaceCurrentItem(with: nil)
+            s.scrubBuild?.terminate(); s.scrubBuild = nil
+            s.scrubReady = false; s.scrubURL = nil; s.scrubbing = false
+            s.scrubPlayer.replaceCurrentItem(with: nil)
+            s.anchor = nil; s.calibBytes = 0; s.calibParams = nil; s.calibFormat = ""
             s.setStatus("Queue empty — drop or record a clip.", "info")
         } else {
             if s.queueIndex >= s.queue.count { s.queueIndex = s.queue.count - 1 }
@@ -1426,7 +1707,9 @@ struct ContentView: View {
                     let scale = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey(rawValue: "NSScreenNumber")] as? NSNumber)?.uint32Value == disp.displayID }?.backingScaleFactor ?? 2
                     pxW = Int(CGFloat(disp.width) * scale); pxH = Int(CGFloat(disp.height) * scale)
                 }
-                try await rec.start(displayID: displayID, sourceRect: sourceRect, pixelW: pxW, pixelH: pxH, micOn: s.micOn, sysAudio: s.sysAudioOn, cursor: s.cursorOn)
+                try await rec.start(displayID: displayID, sourceRect: sourceRect, pixelW: pxW, pixelH: pxH,
+                                    micOn: s.micOn, micDeviceID: s.micDeviceID,
+                                    sysAudio: s.sysAudioOn, cursor: s.cursorOn)
                 s.recording = true
                 if s.regionOn { s.regionSelector?.setRecording(true) }   // fade region UI to a thin outline
                 s.recStart = Date(); s.recElapsed = 0
@@ -1476,6 +1759,15 @@ struct ContentView: View {
         s.loading = true
         s.setStatus("Inspecting \(url.lastPathComponent)…", "work")
         s.player.pause(); s.playing = false
+        // Stale estimate data must never price a different clip.
+        s.anchor = nil
+        s.calibBytes = 0; s.calibParams = nil; s.calibFormat = ""
+        s.autoEstWork?.cancel()
+        // Reset the scrub machinery for the new clip (kill an in-flight proxy build).
+        s.scrubBuild?.terminate(); s.scrubBuild = nil
+        s.scrubReady = false; s.scrubURL = nil; s.scrubbing = false
+        s.scrubPlayer.replaceCurrentItem(with: nil)
+        s.mainSeeker.reset(); s.scrubSeeker.reset()
 
         DispatchQueue.global(qos: .userInitiated).async {
             let dims = runTool(gFFprobe, ["-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","csv=p=0", url.path])
@@ -1531,7 +1823,10 @@ struct ContentView: View {
                 s.seek(0)
                 s.loading = false
                 s.srcFps = fps
-                s.fps = fps > 0 ? fps : 30   // fps slider starts at the source rate (= no change)
+                // Default the export rate to ≤60 (universally playable: H.264 above 60fps
+                // at screen resolutions crosses Level 5.2); the slider still reaches the
+                // source rate for deliberate high-fps exports.
+                s.fps = fps > 0 ? min(fps, 60) : 30
                 // Native previews (mp4/mov/m4v) carry the subtitle track; the proxy doesn't.
                 s.hasCaptions = hasSubs && Self.nativePreviewExts.contains(ext)
                 s.applyCaptions()            // never show subtitles in the preview
@@ -1539,7 +1834,89 @@ struct ContentView: View {
                 // default output to the detected input type
                 s.outFormat = (ext == "gif") ? "GIF" : (ext == "webm" ? "WEBM" : "MP4")
                 s.setStatus("Loaded \(url.lastPathComponent)", "info")
+                // Background workers: the content anchor (honest live estimate), the scrub
+                // proxy (instant dragging), and an automatic measured calibration.
+                self.fetchAnchor(url)
+                self.buildScrubProxy(url)
+                self.scheduleAutoEstimate()
             }
+        }
+    }
+
+    // Content anchor (per-second source video bytes; demux only, so it's fast even for
+    // long files). Arrives async — the estimate uses the rough model until then.
+    func fetchAnchor(_ url: URL) {
+        let w = Double(s.srcW), h = Double(s.srcH)
+        DispatchQueue.global(qos: .utility).async {
+            let csv = runTool(gFFprobe, ["-v","error","-select_streams","v:0",
+                                         "-show_entries","packet=pts_time,size","-of","csv=p=0", url.path])
+            let (cum, total) = parsePackets(csv)
+            DispatchQueue.main.async {
+                guard s.inputURL == url, total > 0 else { return }
+                // ~CRF 20 is typical delivered H.264 (incl. our recording masters); it only
+                // shifts the anchor's baseline — the measured calibration absorbs residue.
+                s.anchor = Anchor(cum: cum, total: total, srcW: w, srcH: h, srcCrf: 20)
+            }
+        }
+    }
+
+    // Scrub proxy: ≤640px / 15fps / keyframe every ~0.5s, no audio — any seek decodes a
+    // handful of tiny frames, so dragging is effectively instant. Built quietly in the
+    // background; the UI scrubs the master until it's ready. Cached by path+size.
+    func buildScrubProxy(_ url: URL) {
+        let srcW = Double(s.srcW), srcH = Double(s.srcH)
+        DispatchQueue.global(qos: .utility).async {
+            let key = "\(url.path):\(Int(fileBytes(url.path)))"
+            let out = NSTemporaryDirectory() + "scscrub_\(abs(key.hashValue)).mp4"
+            if fileBytes(out) <= 1000 {
+                var w = srcW > 0 ? srcW : 1280, h = srcH > 0 ? srcH : 720
+                let longSide = max(w, h)
+                if longSide > 640 { let f = 640 / longSide; w = (w * f).rounded(); h = (h * f).rounded() }
+                let ew = max(2, Int(w) - Int(w) % 2), eh = max(2, Int(h) - Int(h) % 2)
+                let res = runToolChecked(gFFmpeg,
+                    ["-y","-v","error","-i",url.path,
+                     "-vf","fps=15,scale=\(ew):\(eh)",
+                     "-c:v","h264_videotoolbox","-b:v","1M","-g","8",
+                     "-pix_fmt","yuv420p","-an","-movflags","+faststart", out],
+                    onStart: { p in DispatchQueue.main.async { s.scrubBuild = p } })
+                // A killed/failed encode must not poison the cache.
+                if !res.ok || fileBytes(out) <= 1000 { try? FileManager.default.removeItem(atPath: out) }
+            }
+            DispatchQueue.main.async {
+                s.scrubBuild = nil
+                guard s.inputURL == url, fileBytes(out) > 1000 else { return }
+                s.scrubURL = URL(fileURLWithPath: out)
+                s.scrubPlayer.replaceCurrentItem(with: AVPlayerItem(url: s.scrubURL!))
+                s.scrubSeeker.reset()
+                s.scrubReady = true
+            }
+        }
+    }
+
+    // Measure a real sample at the current settings shortly after load, so the size
+    // estimate is honest from the moment the clip opens. Debounced so flipping through
+    // a batch only measures the clip you land on.
+    func scheduleAutoEstimate() {
+        s.autoEstWork?.cancel()
+        let work = DispatchWorkItem {
+            if s.estimating { self.scheduleAutoEstimate() }   // wait for the prior measure
+            else { self.hardEstimate() }
+        }
+        s.autoEstWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    // Capturable microphones for the recording toolbar's device picker.
+    func enumerateMics() {
+        if #available(macOS 14, *) {
+            let ds = AVCaptureDevice.DiscoverySession(deviceTypes: [.microphone, .external],
+                                                      mediaType: .audio, position: .unspecified)
+            s.micDevices = ds.devices.map { (id: $0.uniqueID, name: $0.localizedName) }
+        } else {
+            s.micDevices = AVCaptureDevice.devices(for: .audio).map { (id: $0.uniqueID, name: $0.localizedName) }
+        }
+        if !s.micDevices.contains(where: { $0.id == s.micDeviceID }) {
+            s.micDeviceID = s.micDevices.first?.id ?? ""
         }
     }
 
@@ -1580,8 +1957,8 @@ struct ContentView: View {
         let base = tmp + "mbcap"
         try? FileManager.default.removeItem(atPath: base + ".srt")
         try? FileManager.default.removeItem(atPath: base + ".txt")
-        // whisper wants 16 kHz mono PCM
-        _ = runTool(gFFmpeg, ["-y","-v","error","-i",input.path,"-ss",String(st),"-t",String(dur),
+        // whisper wants 16 kHz mono PCM (-ss before -i: fast keyframe seek)
+        _ = runTool(gFFmpeg, ["-y","-v","error","-ss",String(st),"-i",input.path,"-t",String(dur),
                               "-vn","-ar","16000","-ac","1","-c:a","pcm_s16le", wav])
         guard fileBytes(wav) > 1000 else { return (nil, nil) }   // no audio track
         let env = gGgmlBackends.isEmpty ? [:] : ["GGML_BACKEND_PATH": gGgmlBackends]
@@ -1615,15 +1992,18 @@ struct ContentView: View {
         if panel.runModal() == .OK, let u = panel.url { s.exportFolder = u }
     }
 
-    // After a successful batch export, load the next clip or finish.
-    func advanceAfterExport(_ savedName: String) {
+    // After a successful export: with more clips queued, advance to the next; otherwise
+    // show "Saved to <full path>" with a Show-in-folder button. The message is always
+    // about THE CLIP just exported — never a generic "Batch complete".
+    func advanceAfterExport(_ savedName: String, _ savedURL: URL) {
         NSSound(named: "Glass")?.play()
-        if s.queueIndex + 1 < s.queue.count {
+        if s.queue.count > 1, s.queueIndex + 1 < s.queue.count {
             s.queueIndex += 1
             s.setStatus("Saved \(savedName) — loading clip \(s.queueIndex + 1)/\(s.queue.count)…", "ok")
             load(s.queue[s.queueIndex])
         } else {
-            s.setStatus("Batch complete — \(s.queue.count) clips exported.", "ok")
+            s.setStatus("Saved to \(savedURL.path)", "ok")
+            s.revealURL = savedURL
         }
     }
 
@@ -1647,6 +2027,7 @@ struct ContentView: View {
         let out = uniqueOutputURL(s.exportFolder, nm, ext)
 
         let quality = s.quality, fpsOv = fpsOverride()
+        let fast = s.fastExport && fastApplies(fmt)
         let burn = s.capBurn, wantSrt = s.capSrt, wantTxt = s.capTxt
         let wantCaps = burn || wantSrt || wantTxt
         let folder = s.exportFolder
@@ -1671,9 +2052,12 @@ struct ContentView: View {
                 }
                 DispatchQueue.main.async { s.setStatus("Exporting \(fmt) · \(qLabel(quality))\(posLbl)…", "work") }
             }
-            let p = plan(fmt, quality, crop, fpsOv)
+            let p = plan(fmt, quality, crop, fpsOv, fast)
             let startT = Date()
-            let err = runFFmpegProgress(["-y","-v","error","-progress","pipe:1","-i",input.path,"-ss",String(st),"-t",String(durSel),
+            // -ss BEFORE -i: jump straight to the trim point (keyframe seek + precise
+            // decode) instead of decoding the whole file and discarding frames — still
+            // frame-accurate when re-encoding, much faster for trims deep into a clip.
+            let res = runFFmpegProgress(["-y","-v","error","-progress","pipe:1","-ss",String(st),"-i",input.path,"-t",String(durSel),
                                          "-vf",p.vf] + args(p.codec) + [out.path], total: durSel,
                                         onStart: { proc in DispatchQueue.main.async { s.exportProcess = proc } }) { frac in
                 let elapsed = Date().timeIntervalSince(startT)
@@ -1681,7 +2065,7 @@ struct ContentView: View {
                 DispatchQueue.main.async { s.exportProgress = frac; s.exportETA = etaString(eta) }
             }
             // Embed a soft (toggleable) subtitle track for MP4 when requested.
-            if burn, ext == "mp4", let srt = burnSrt, FileManager.default.fileExists(atPath: out.path) {
+            if res.code == 0, burn, ext == "mp4", let srt = burnSrt, FileManager.default.fileExists(atPath: out.path) {
                 let tmp = out.path + ".subs.mp4"
                 _ = runTool(gFFmpeg, ["-y","-v","error","-i",out.path,"-i",srt,"-map","0","-map","1",
                                       "-c","copy","-c:s","mov_text","-metadata:s:s:0","language=eng",
@@ -1698,57 +2082,59 @@ struct ContentView: View {
                 if cancelled {
                     try? FileManager.default.removeItem(atPath: out.path)
                     s.setStatus("Export canceled.", "info")
-                } else if FileManager.default.fileExists(atPath: out.path) {
-                    if isBatch { advanceAfterExport(out.lastPathComponent) }
-                    else {
-                        s.setStatus("Saved \(out.lastPathComponent)", "ok")
-                        NSSound(named: "Glass")?.play()
-                    }
+                } else if res.code == 0, FileManager.default.fileExists(atPath: out.path) {
+                    advanceAfterExport(out.lastPathComponent, out)
                 } else {
-                    s.setStatus("Export failed: \(err.suffix(160))", "err")
+                    // ffmpeg died mid-encode: remove the half-written file so a broken
+                    // clip is never left where the "Saved" one should be.
+                    try? FileManager.default.removeItem(atPath: out.path)
+                    s.setStatus("Export failed: \(res.output.suffix(160))", "err")
                 }
             }
         }
     }
 
-    // "Harder estimate": encode a short real sample at the actual export settings and
-    // extrapolate to the full trim. More accurate than the live model (CRF/VP9 sizes
-    // depend on content); the result replaces the auto numbers until a setting changes.
+    // "Harder estimate": encode short real samples at the actual export settings and
+    // extrapolate to the full trim, then CALIBRATE the live model with the result
+    // (factor = measured / model at the measured settings). Runs automatically on load
+    // and on demand via the button; quiet — progress shows in the estimate card, not
+    // the status bar. Cancel-safe: a stale result for a different clip is discarded.
     func hardEstimate() {
-        guard let input = s.inputURL else { return }
+        guard let input = s.inputURL, !s.estimating, !s.exporting else { return }
         let (crop, st, durSel) = cropTrim()
-        // Sample from ~1/4 in (skip any atypical opening) over a window long enough
-        // that a single keyframe doesn't dominate and inflate the extrapolation.
-        let sampleDur = min(4.0, max(0.5, durSel))
-        let sampleStart = st + max(0, (durSel - sampleDur) * 0.25)
-        let factor = durSel / sampleDur
+        let measured = estParams()             // the settings the samples are encoded at
         let fmt = s.outFormat
         let tmp = NSTemporaryDirectory()
-        let sig = estSig
         let quality = s.quality, fpsOv = fpsOverride()
+        let fast = s.fastExport && fastApplies(fmt)
+        // Three short windows spread across the trim (20/50/80%) so one unusually quiet
+        // or busy moment can't skew the estimate; short trims collapse to one window.
+        let wd = 1.5
+        let windows: [(start: Double, dur: Double)] = durSel <= 6
+            ? [(st, min(4.0, max(0.5, durSel)))]
+            : [0.2, 0.5, 0.8].map { (st + (durSel - wd) * $0, wd) }
 
         s.estimating = true
-        s.setStatus("Running harder estimate (\(fmt))…", "work")
         DispatchQueue.global(qos: .userInitiated).async {
-            // Encode a sample with the SAME plan() settings export will use.
+            // Encode the sample windows with the SAME plan() settings export will use.
             func sample(_ f: String) -> Double {
-                let p = plan(f, quality, crop, fpsOv)
-                let o = tmp + "est." + extFor(f)
-                _ = runTool(gFFmpeg, ["-y","-v","error","-ss",String(sampleStart),"-i",input.path,"-t",String(sampleDur),
-                                      "-vf",p.vf] + args(p.codec) + [o])
-                return fileBytes(o)
+                let p = plan(f, quality, crop, fpsOv, fast)
+                var bytes = 0.0, sampled = 0.0
+                for (i, w) in windows.enumerated() {
+                    let o = tmp + "scest_\(i)." + extFor(f)
+                    _ = runTool(gFFmpeg, ["-y","-v","error","-ss",String(w.start),"-i",input.path,"-t",String(w.dur),
+                                          "-vf",p.vf] + args(p.codec) + [o])
+                    bytes += fileBytes(o); sampled += w.dur
+                }
+                return sampled > 0 ? bytes * durSel / sampled : 0   // extrapolate to the full trim
             }
-            let bytes: Double
-            switch fmt {
-            case "Web":  bytes = (sample("WEBM") + sample("GIF")) * factor
-            case "GIF":  bytes = sample("GIF") * factor
-            case "WEBM": bytes = sample("WEBM") * factor
-            default:     bytes = sample(fmt) * factor
-            }
+            let bytes = fmt == "Web" ? sample("WEBM") + sample("GIF") : sample(fmt)
             DispatchQueue.main.async {
                 s.estimating = false
-                s.hardBytes = bytes; s.hardSig = sig
-                s.setStatus("Measured ≈ \(humanSize(bytes + captionBytes())) from a \(mmss(sampleDur)) sample.", "ok")
+                guard s.inputURL == input else { return }   // switched clips mid-measure
+                s.calibBytes = max(0, bytes)
+                s.calibParams = measured
+                s.calibFormat = fmt
             }
         }
     }
@@ -1766,10 +2152,11 @@ struct ContentView: View {
         let webm = folder.appendingPathComponent("\(base).webm")
         let gif = folder.appendingPathComponent("\(base).gif")
 
-        let pw = plan("WEBM", s.quality, crop, fpsOverride())
+        let pw = plan("WEBM", s.quality, crop, fpsOverride(), s.fastExport)
         let pg = plan("GIF", s.quality, crop, fpsOverride())
-        let webmArgs = ["-y","-v","error","-progress","pipe:1","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pw.vf] + args(pw.codec) + [webm.path]
-        let gifArgs = ["-y","-v","error","-progress","pipe:1","-i",input.path,"-ss",String(st),"-t",String(durSel),"-vf",pg.vf, gif.path]
+        // -ss before -i (fast keyframe seek; see export()).
+        let webmArgs = ["-y","-v","error","-progress","pipe:1","-ss",String(st),"-i",input.path,"-t",String(durSel),"-vf",pw.vf] + args(pw.codec) + [webm.path]
+        let gifArgs = ["-y","-v","error","-progress","pipe:1","-ss",String(st),"-i",input.path,"-t",String(durSel),"-vf",pg.vf, gif.path]
 
         s.exporting = true
         s.exportProgress = 0; s.exportETA = ""
@@ -1784,7 +2171,7 @@ struct ContentView: View {
             let reg: (Process) -> Void = { proc in DispatchQueue.main.async { s.exportProcess = proc } }
             let t1 = Date()
             let e1 = runFFmpegProgress(webmArgs, total: durSel, onStart: reg) { report($0, t1) }
-            var e2 = ""
+            var e2: (output: String, code: Int32) = ("", 0)
             if !s.exportCancelled {
                 DispatchQueue.main.async { s.exportProgress = 0; s.exportETA = ""; s.setStatus("webm done, building gif…", "work") }
                 let t2 = Date()
@@ -1800,16 +2187,14 @@ struct ContentView: View {
                 }
                 s.exporting = false; s.exportProgress = 0; s.exportETA = ""
                 s.exportProcess = nil
-                let okW = FileManager.default.fileExists(atPath: webm.path)
-                let okG = FileManager.default.fileExists(atPath: gif.path)
+                let okW = e1.code == 0 && FileManager.default.fileExists(atPath: webm.path)
+                let okG = e2.code == 0 && FileManager.default.fileExists(atPath: gif.path)
                 if okW && okG {
-                    if isBatch { advanceAfterExport("\(base)_forweb/") }
-                    else {
-                        s.setStatus("Saved \(folder.lastPathComponent)/ (webm + gif)", "ok")
-                        NSSound(named: "Glass")?.play()
-                    }
+                    advanceAfterExport("\(base)_forweb/", folder)
                 } else {
-                    s.setStatus("Web export issue — webm:\(okW ? "ok" : "fail") gif:\(okG ? "ok" : "fail") \((e1 + e2).suffix(140))", "err")
+                    // Never leave a half-built bundle where a "Saved" one should be.
+                    try? FileManager.default.removeItem(at: folder)
+                    s.setStatus("Web export issue — webm:\(okW ? "ok" : "fail") gif:\(okG ? "ok" : "fail") \((e1.output + e2.output).suffix(140))", "err")
                 }
             }
         }
@@ -1823,24 +2208,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { true }
 
-    // Wipe stashed imports plus leftover recordings/preview proxies on quit.
+    // Wipe stashed imports plus leftover recordings/proxies/estimate samples on quit.
     func applicationWillTerminate(_ n: Notification) {
         let fm = FileManager.default
         try? fm.removeItem(at: gStashDir)
         if let items = try? fm.contentsOfDirectory(atPath: NSTemporaryDirectory()) {
-            for f in items where f.hasPrefix("mbrec_") || f.hasPrefix("scpreview_") {
+            for f in items where f.hasPrefix("mbrec_") || f.hasPrefix("scpreview_")
+                              || f.hasPrefix("scscrub_") || f.hasPrefix("scest_") {
                 try? fm.removeItem(atPath: NSTemporaryDirectory() + f)
             }
         }
     }
 }
 
+// The build version, shown in the title bar (build.sh stamps it into Info.plist).
+let gAppVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
+
 @main
 struct ClipEditorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject var state = EditorState()
     var body: some Scene {
-        WindowGroup("SimpleClips") { ContentView().environmentObject(state) }
+        WindowGroup("SimpleClips — V \(gAppVersion)") { ContentView().environmentObject(state) }
             .windowResizability(.contentSize)
     }
 }

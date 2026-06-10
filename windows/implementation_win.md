@@ -8,12 +8,13 @@
 ```
 /                          shared spec + git
   spec.md                  product intent + architecture (platform-agnostic)
-  Patch notes.md           user-facing release notes (V1.01, V1.02, ...)
   Downloadable builds/     shipped installers (exes git-ignored; versioned names)
   mac/                     macOS app — Swift/SwiftUI/AppKit (the ORIGINAL)
     implementation_Mac.md  how the macOS app is built
+    Patch notes.md         Mac release notes (versions independently of Windows)
   windows/                 Windows app — Electron (the rebuild)
     implementation_win.md  this file
+    Patch notes.md         Windows release notes (V1.01, V1.02, ...)
 ```
 
 **Rule:** Windows work only edits `windows/` (and the shared root `spec.md`). The macOS
@@ -207,12 +208,13 @@ Both bundle ffmpeg/ffprobe (asar-unpacked), `whisper-cli` + DLLs, and the captio
 so they run fully offline.
 
 **Versioning + patch notes (the release ritual).** Versions iterate **V1.01, V1.02, ...**
-in `Patch notes.md` at the repo root. For each release: bump `windows/package.json` to the
-matching semver `1.0.x` BEFORE building (the title bar reads it at runtime via
-`app:version`, displayed as `V 1.0x`), build, then copy the artifacts into
-`Downloadable builds/Windows/` named with the patch version —
+in `windows/Patch notes.md` (each platform keeps its own notes and versions
+independently — Mac's are in `mac/Patch notes.md`). For each release: bump
+`windows/package.json` to the matching semver `1.0.x` BEFORE building (the title bar
+reads it at runtime via `app:version`, displayed as `V 1.0x`), build, then copy the
+artifacts into `Downloadable builds/Windows/` named with the patch version —
 `SimpleClips Setup 1.0x.exe` and `SimpleClips-1.0x-portable.exe` — replacing the previous
-pair, and add a simple, readable entry to `Patch notes.md` covering all changes. The
+pair, and add a simple, readable entry to `windows/Patch notes.md` covering all changes. The
 binaries are git-ignored (they exceed GitHub's 100 MB limit); **distribute via GitHub
 Releases**, not the repo. (Watch for the portable exe being locked by a running instance —
 close SimpleClips first.)

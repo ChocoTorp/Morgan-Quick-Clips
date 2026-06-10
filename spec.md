@@ -108,15 +108,16 @@ The estimate always shows projected size, the savings vs. the source (e.g. "−7
 ```
 Morgan-Quick-Clips/
 ├── spec.md                  ← this file (intent + architecture)
-├── Patch notes.md           ← user-facing release notes (V1.01, V1.02, ...)
 ├── Downloadable builds/
 │   ├── Windows/             ← shipped installers, named with the version
 │   │                          (SimpleClips Setup 1.0x.exe, SimpleClips-1.0x-portable.exe)
 │   └── Mac/
 ├── windows/                 ← Electron app (the Windows build)
-│   └── implementation_win.md  ← deep implementation notes
+│   ├── implementation_win.md  ← deep implementation notes
+│   └── Patch notes.md       ← Windows release notes (V1.01, V1.02, ...)
 └── mac/                     ← Swift app (the original macOS build)
-    └── implementation_Mac.md
+    ├── implementation_Mac.md
+    └── Patch notes.md       ← Mac release notes (independent versioning)
 ```
 
 ### Windows app (Electron)
@@ -167,9 +168,9 @@ A single-source SwiftUI app (`mac/Sources/ClipEditor.swift`) built by `mac/build
 
 ### Versioning and releases
 
-- Versions iterate **V1.01, V1.02, ...** in `Patch notes.md` (root), each entry a simple, readable list of all changes since the last.
-- `windows/package.json` carries the matching semver (`1.0.x`); the title bar reads it at runtime, so the UI version always matches the build.
-- Shipped artifacts are copied into `Downloadable builds/Windows/` named with the patch version, replacing the previous pair.
+- The two builds version **independently**: each platform keeps its own release notes — `mac/Patch notes.md` and `windows/Patch notes.md` — iterating **V1.01, V1.02, ...** with a simple, readable list of all changes since that platform's last release.
+- `windows/package.json` carries the Windows semver (`1.0.x`); `mac/build.sh` carries the Mac `VERSION`. The title bar reads the version at runtime on both platforms, so the UI always matches the build.
+- Shipped artifacts are copied into `Downloadable builds/Windows/` (named with the patch version, replacing the previous pair) or `Downloadable builds/mac/`.
 
 ---
 

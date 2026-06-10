@@ -1,4 +1,6 @@
-# SimpleClips - Patch Notes
+# SimpleClips for Windows - Patch Notes
+
+(The Mac and Windows builds version independently — Mac releases are in [mac/Patch notes.md](../mac/Patch%20notes.md).)
 
 ## V1.03 - June 9, 2026
 

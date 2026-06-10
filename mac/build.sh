@@ -17,6 +17,9 @@ BUNDLE=0; [ "${1:-}" = "--bundle" ] && BUNDLE=1
 
 APP_NAME="SimpleClips"
 EXE="SimpleClips"
+VERSION="1.04"                        # matches the latest entry in "mac/Patch notes.md"
+                                      # (platforms version independently); the title bar
+                                      # reads it at runtime from Info.plist
 BUNDLE_ID="com.mblocal.clipeditor1"   # unchanged on purpose: keeps the existing TCC permission grant
 OUT_DIR="${APP_OUT:-$(pwd)/build}"
 APP="$OUT_DIR/$APP_NAME.app"
@@ -54,8 +57,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>SimpleClips</string>
   <key>CFBundleDisplayName</key><string>SimpleClips</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-  <key>CFBundleVersion</key><string>1.0</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>$EXE</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>

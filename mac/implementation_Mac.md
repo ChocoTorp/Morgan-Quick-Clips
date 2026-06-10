@@ -2,7 +2,7 @@
 
 How the app is actually built. Pairs with [spec.md](../spec.md) (what each feature is
 *for*). All UI and logic live in a single Swift file: [Sources/ClipEditor.swift](Sources/ClipEditor.swift)
-(~1.8k lines). Media work shells out to `ffmpeg`/`ffprobe`/`whisper-cli`.
+(~2.2k lines). Media work shells out to `ffmpeg`/`ffprobe`/`whisper-cli`.
 
 ## Stack & shape
 
@@ -37,7 +37,7 @@ into tokens; nothing is ever passed to `/bin/sh`.
 
 ## Encoding model — the `plan()` function
 
-`plan(format, q, crop, fps)` is the **single source of truth for encode settings**,
+`plan(format, q, crop, fps, hw)` is the **single source of truth for encode settings**,
 shared by both export *and* the estimator so the estimate reflects exactly what export
 will do. It returns `(vf:` filtergraph `, codec:` trailing args `)`.
 
@@ -46,7 +46,19 @@ will do. It returns `(vf:` filtergraph `, codec:` trailing args `)`.
 - **Per-format curves** map `q` to real encoder knobs:
   - **H.264 family** (MP4/MOV/M4V/MKV/AVI/TS/FLV/F4V/3GP): `libx264`, CRF `14→30`,
     preset `slow/medium/slower`, AAC `256→96 kbps`; `+faststart` for MP4/MOV/M4V;
-    baseline profile for 3GP.
+    baseline profile for 3GP. With **`fast`** (the UI's Fast-export toggle) the preset
+    becomes `veryfast` (WebM: `cpu-used 5`) — measured ~2× faster on real 4K screen
+    content for under one VMAF point. `fastApplies()` excludes GIF/MPEG-2/WMV, where
+    encoder effort changes nothing; the UI grays out only the Fast option there.
+    **Flipping the toggle re-runs the auto-measure** — a calibration taken in the other
+    mode is only a model-transferred guess for this one.
+  - **Why no hardware (VideoToolbox) mode:** tried and removed after measuring on real
+    content. On Apple Silicon the media engine is pixel-bound (~100fps at 4K, ~350fps
+    at 1080p) so multi-core x264 matches or beats it on wall-clock, and x264 is far
+    better per byte (VMAF 97.1 @ 3.6 Mbps vs 90.6 @ 4.7 Mbps on a real 4K recording).
+    Its constant-quality `-q:v` scale also relates to CRF differently per clip, which
+    made honest "faster but larger" labeling impossible. VideoToolbox's only real win
+    is energy, which isn't worth the size/quality trade here.
   - **WebM:** `libvpx-vp9`, CRF `18→40`, Opus `192→96 kbps`.
   - **GIF:** two-pass `palettegen`/`paletteuse`; palette mode and dither degrade with
     `q`; fps `20→12`.
@@ -69,12 +81,29 @@ will do. It returns `(vf:` filtergraph `, codec:` trailing args `)`.
 
 `load(url)` runs `ffprobe` on a background queue to read width/height, duration,
 `r_frame_rate` (parsed from `"30000/1001"` form), and whether a subtitle stream exists.
+The fps slider then defaults to **min(source, 60)** — universally playable; the slider
+still reaches the source rate for deliberate high-fps exports.
 
 **AVPlayer only decodes mp4/mov/m4v** (`nativePreviewExts`). For anything else (webm,
 mkv, avi, gif, wmv, …) the app transcodes a **fast hardware proxy** (`h264_videotoolbox`,
 even-dimension scale) to a temp `scpreview_<hash>.mp4` *purely for scrubbing*.
 Editing/export always use the original file. Embedded subtitles are deselected in the
 preview (`applyCaptions`) so a "default"-flagged track never shows itself.
+
+### Scrubbing (coalesced seeks + scrub proxy)
+
+- Every drag-seek goes through a **`CoalescedSeeker`** (one zero-tolerance seek in flight
+  per `AVPlayer`; while it works only the *latest* target is kept), so a fast drag can't
+  queue stale seeks the picture then replays in slow motion.
+- After load, `buildScrubProxy` builds a **scrub proxy** in the background
+  (≤640px, 15fps, keyframe every ~0.5s (`-g 8`), no audio, `h264_videotoolbox`, cached as
+  `scscrub_<hash>.mp4` by path+size). While the playhead/trim handles are dragged, a second
+  `AVPlayerLayer` stacked over the preview shows the proxy (instant seeks); on release it
+  hides and the master settles on the exact frame (`endScrub`). Until the proxy is ready,
+  drags scrub the master through the coalesced seeker. Loading another clip terminates an
+  in-flight build; failed/killed builds delete their partial file so the cache can't be
+  poisoned. The periodic time observer ignores updates while `scrubbing` (the drag owns
+  `current`).
 
 ## Screen recording (`ScreenRecorder`)
 
@@ -83,7 +112,10 @@ In-process **ScreenCaptureKit** (`@available(macOS 15, *)`):
 - `SCStream` + `SCRecordingOutput` write an `.mov` (H.264) directly to a temp file —
   the recording permission attaches to the app itself.
 - `SCStreamConfiguration` carries pixel size (even dims), optional `sourceRect` (region),
-  cursor, `captureMicrophone`, and `capturesAudio` (system audio).
+  cursor, `captureMicrophone` + `microphoneCaptureDeviceID` (the toolbar's mic picker,
+  enumerated via `AVCaptureDevice.DiscoverySession`), and `capturesAudio` (system audio).
+- Capture rate follows the display's refresh, **clamped to 120** like the Windows build
+  (a 240Hz master gains nothing but encode time; exports default to ≤60 regardless).
 - `stop()` uses a `CheckedContinuation` with a **2s timeout** so finishing the file
   never hangs. On success the clip drops into the queue and loads.
 
@@ -114,7 +146,8 @@ display, matched to the picker order, shown/hidden as the screen popover opens/c
 A single `VStack` of cards (`SectionCard` modifier):
 
 1. **Recording toolbar** — Region/Fullscreen segmented picker, screen picker (with
-   number overlays), Mic / Screen-audio / Cursor checkboxes, Record button.
+   number overlays), Mic checkbox + device picker, Screen-audio / Cursor checkboxes,
+   Record button.
 2. **Preview unit** (one bordered block): the `PlayerView` (an `NSViewRepresentable`
    wrapping an `AVPlayerLayer`), the **`CropOverlay`** (dim-outside + draggable corners,
    all math in fitted-rect space via `fittedRect`), a clip/queue bar, the play button,
@@ -125,24 +158,45 @@ A single `VStack` of cards (`SectionCard` modifier):
 3. **Sliders + estimate card** — Resolution (slider + exact W×H px fields), Quality
    (inverted so the knob reads Optimized→Fidelity while `quality` stays 0=fidelity
    underneath), FPS (slider + a typeable field, both clamped to the source rate, matching
-   the Windows build). The estimate card is height-locked to the slider
-   column via a measured `GeometryReader` height.
+   the Windows build). Between the sliders and the estimate sits the vertical
+   **export-speed toggle** (custom radio rows): "Fast export — about twice as fast" /
+   "Best compression — slower, smallest file" (default). For formats that ignore
+   encoder effort (GIF/MPG/WMV) only the Fast row grays out and Best compression shows
+   selected (the stored preference survives a format round-trip). The estimate card is
+   height-locked to the slider column via a measured `GeometryReader` height.
 4. **Output row** — name field, captions popover, format picker, export-folder button,
    Export button.
 5. **Status bar** — idle summary, or a determinate progress bar + ETA + Cancel while
-   exporting; colored by `statusKind` (info/work/ok/err).
+   exporting; colored by `statusKind` (info/work/ok/err). After a save it carries the
+   **Show in folder** button (see Export pipeline).
 
-## Size estimation
+## Size estimation (three layers, matching the Windows build)
 
-- **Live estimate** (`liveBytes`): an instant, no-encode analytic model — bytes ≈
-  pixels × fps × duration × bits-per-pixel, where bpp follows the CRF curve
-  (`~6 CRF ≈ half size`), plus audio bits. Rough by design.
-- **Harder estimate** (`hardEstimate`): encodes a **real sample** (~4s window, started
-  ~¼ into the trim to skip atypical openings and avoid a single keyframe dominating)
-  with the **same `plan()` settings** as export, then multiplies by `duration/sample`.
-- `estSig` fingerprints every size-affecting setting; the measured number
-  (`hardBytes`) is only shown while `hardSig == estSig`, otherwise the UI falls back to
-  the live model. `captionBytes()` adds a small estimate for an embedded sub track.
+All model code lives in free functions over an **`EstParams`** snapshot (every
+size-affecting setting), so a calibration taken at one set of settings can be
+re-evaluated against the model later.
+
+1. **Instant model** (`liveBytes`): a no-encode analytic model — bytes ≈ pixels × fps ×
+   duration × bits-per-pixel, where bpp follows the CRF curve (`~6 CRF ≈ half size`),
+   plus audio bits. Only the first ~0.3s fallback; rough by design.
+2. **Content anchor** (`anchoredBytes`): after load, `fetchAnchor` reads every video
+   packet's size via ffprobe (`packet=pts_time,size`, demux only — fast) into a
+   per-second cumulative array (`parsePackets` → `Anchor`). The estimate then scales the
+   source's REAL bytes for the trim range by `2^(ΔCRF/6) × pixelRatio^0.85 ×
+   fpsRatio^0.6 × codecFactor` + audio. Trimming is content-aware (a static intro
+   "costs" less than a busy section). GIF stays on the model (palette-driven); srcCrf is
+   assumed ~20.
+3. **Measured calibration** (`hardEstimate`, auto-run ~300ms after load via
+   `scheduleAutoEstimate` and on demand via the button): encodes **three 1.5s windows at
+   20/50/80% of the trim** (one window for short trims) with the **same `plan()`
+   settings** as export and extrapolates. Stored as `calibBytes`/`calibParams`; the
+   displayed estimate multiplies by `measured / estBase(calibParams)` recomputed on
+   every read, so the correction stays consistent even when the base improves
+   underneath (e.g. the anchor arriving after the measurement). Per-format; reset on
+   load; a result for a clip that's no longer loaded is discarded.
+
+The card's sub-line shows which layer is live (`rough` → `live` → `calibrated`, or
+`measuring…`), and `captionBytes()` adds a small constant for an embedded sub track.
 
 ## Captions (`makeCaptions`)
 
@@ -157,14 +211,24 @@ on MP4-family output, a second ffmpeg pass muxes the `.srt` as a soft `mov_text`
 `export()` (background queue):
 
 1. Build crop+scale filter and trim window via `cropTrim()` (even dims, clamped to
-   source; appends `scale=…:flags=lanczos` only when output ≠ crop size).
+   source; appends `scale=…:flags=lanczos` only when output ≠ crop size). The trim is
+   applied with **`-ss` before `-i`** (fast keyframe seek + precise decode — still
+   frame-accurate when re-encoding) so exporting a section deep into a long file
+   doesn't decode everything before it; same for the Web bundle and caption extraction.
 2. If captions requested, run `makeCaptions` first (and copy sidecars).
 3. Resolve a **collision-free output path** with `uniqueOutputURL` (`clip`, `clip_1`, …).
 4. Run **`runFFmpegProgress`** — ffmpeg with `-progress pipe:1`, parsing the last
    `out_time=` to drive the progress bar; `onStart` hands back the `Process` so
-   **Cancel** can `terminate()` it. ETA computed from elapsed vs. fraction.
-5. On cancel, delete the partial file. On success in a batch, `advanceAfterExport`
-   loads the next clip; a `Glass` sound confirms.
+   **Cancel** can `terminate()` it. ETA computed from elapsed vs. fraction. It returns
+   the **exit code**: success requires `code == 0` (a file merely existing is not
+   success — ffmpeg leaves partials behind when it dies mid-encode).
+5. On cancel **or failure**, delete the partial file — a broken clip is never left
+   where a "Saved" one should be, and a failure never reports "Saved".
+6. On success, `advanceAfterExport`: with more clips queued, load the next one
+   ("Saved <name> — loading clip x/y"); otherwise show **"Saved to <full path>"** with a
+   **Show in folder** button (`NSWorkspace.activateFileViewerSelecting`; `revealURL` is
+   cleared by the next status). The message is always about the clip just exported —
+   never a generic "Batch complete". A `Glass` sound confirms.
 
 **Web bundle** (`exportWeb`): creates a collision-safe `<name>_forweb/` folder and
 encodes a `.webm` then a `.gif` into it, with progress reported for each pass.
@@ -179,7 +243,11 @@ prune the queue.
 ## Build & distribution
 
 - **[build.sh](build.sh)** compiles the single file with `swiftc -O -parse-as-library`
-  into a hand-assembled `.app` (Info.plist + icon written inline).
+  into a hand-assembled `.app` (Info.plist + icon written inline). `VERSION` at the top
+  of the script is stamped into `CFBundleShortVersionString`; the title bar reads it at
+  runtime (`gAppVersion`, "SimpleClips — V 1.0x"). The Mac and Windows builds version
+  **independently** — bump `VERSION` together with a new entry in
+  [Patch notes.md](Patch%20notes.md) (this folder) before building a release.
   - **Signing is deliberate:** a *stable* signature is what preserves the macOS TCC
     grant (Screen Recording) across rebuilds. It uses the first local code-signing
     identity if present, else ad-hoc (which re-randomizes the requirement each build
